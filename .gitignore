@@ -1,0 +1,9 @@
+node_modules/
+.tools/
+test-results/
+private/
+imports/
+exports/
+*.private.*
+.env*
+__pycache__/

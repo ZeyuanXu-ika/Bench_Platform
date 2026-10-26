@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="音视频证据标注工作台：本地文件导入、本地草稿与 JSON 结果导出。">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; media-src blob:; img-src 'self' data:; connect-src 'self'; worker-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'">
+  <meta name="referrer" content="no-referrer">
+  <meta name="color-scheme" content="light">
+  <title>Bench Platform · 本地标注工作台</title>
+  <link rel="icon" href="./favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="./styles.css">
+  <script type="module" src="./app.mjs"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="./" aria-label="Bench Platform 首页"><span class="brand-mark" aria-hidden="true">b.</span><span>BENCH<span class="brand-sub">音视频证据标注工作台</span></span></a>
+    <div class="top-actions"><span class="local-badge"><i></i> 本地文件模式</span><button id="help-button" class="quiet">使用说明 <span aria-hidden="true">↗</span></button></div>
+  </header>
+  <main>
+    <section id="welcome" class="welcome">
+      <div class="welcome-copy"><span class="eyebrow">LOCAL FILES · LOCAL RESULTS</span><h1>让观察有据可循。<br><span>让数据留在本地。</span></h1><p>选择分配给你的音视频，标记证据区间，记录观察。<br>完成后导出结果文件，再提交到飞书。</p><div class="onboarding-actions"><button id="welcome-manifest" class="primary">导入任务清单 <span aria-hidden="true">↗</span></button><button id="welcome-media" class="secondary">直接选择素材</button></div><div class="welcome-foot"><button id="welcome-result" class="text-button">导入已有结果，继续标注</button><span>·</span><a href="./samples/demo-task.zip" download>下载演示任务包</a></div></div>
+      <div class="welcome-art" aria-hidden="true"><div class="art-index">01 — 观察 / 02 — 证据 / 03 — 核验</div><div class="art-view"><div class="art-cross a"></div><div class="art-cross b"></div><div class="art-time">00:01.000 <span>→</span> 00:03.000</div><div class="art-label"><span></span> 视觉观察</div></div><div class="art-timeline"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div><div class="art-caption">每一条判断，都有一个可回看的时间区间。</div></div>
+      <div class="welcome-steps"><div><b>01</b><span>下载并选择本地素材</span></div><div><b>02</b><span>标记区间，填写观察</span></div><div><b>03</b><span>导出 JSON，提交飞书</span></div></div>
+    </section>
+    <section id="workspace" class="workspace" hidden>
+      <aside class="sidebar">
+        <div class="section-heading"><span class="eyebrow">TASK QUEUE</span><span id="task-count" class="count">0</span></div><h2>本次任务</h2>
+        <div class="identity"><label>批次 ID<input id="batch-id" maxlength="200" autocomplete="off" placeholder="例如 batch_001"></label><label>任务 ID<input id="assignment-id" maxlength="200" autocomplete="off" placeholder="飞书分配的任务编号"></label><label>标注员 ID<input id="annotator-id" maxlength="200" autocomplete="off" placeholder="例如 ann01"></label></div>
+        <div class="progress-line"><span id="progress-label">0 / 0 已完成</span><span id="progress-percent">0%</span></div><progress id="progress" value="0" max="1" aria-label="任务完成进度"></progress>
+        <label class="search-label"><span class="sr-only">搜索任务</span><input id="task-search" type="search" placeholder="搜索 ID 或标题…"></label>
+        <nav id="task-list" aria-label="素材任务列表"></nav>
+        <div class="sidebar-bottom"><button id="import-manifest" class="quiet">＋ 导入任务</button><button id="drafts-button" class="quiet">恢复草稿</button></div>
+      </aside>
+      <div class="work-area">
+        <div class="workspace-toolbar"><div id="draft-status" class="draft-status" role="status">浏览器草稿就绪</div><div class="toolbar-actions"><button id="import-result" class="quiet">导入结果</button><button id="attach-media" class="secondary small">选择本地素材</button><button id="attach-folder" class="secondary small">选择素材文件夹</button><button id="download-result" class="quiet" title="通过浏览器下载导出，不打开原生保存路径对话框">下载 JSON</button><button id="export-result" class="primary small">导出本地结果 <span aria-hidden="true">↗</span></button></div></div>
+        <div class="task-heading"><div><span id="item-kind" class="eyebrow">VIDEO EVIDENCE</span><h2 id="item-title"></h2><div id="item-id" class="item-id"></div></div><span id="item-status" class="status-tag">待标注</span></div>
+        <p id="task-description" class="task-description" hidden></p>
+        <div class="editor-grid">
+          <section class="media-column" aria-label="素材与证据区间">
+            <div class="media-stage"><div id="media-empty" class="media-empty"><span class="empty-icon" aria-hidden="true">↗</span><h3>选择这条任务对应的本地文件</h3><p id="missing-path"></p><button id="attach-current" class="stage-button">选择素材文件</button></div><video id="video" controls preload="metadata" playsinline hidden></video><div id="audio-stage" hidden><div class="audio-symbol" aria-hidden="true">∿</div><span>声音，是另一种证据。</span><audio id="audio" controls preload="metadata"></audio></div></div>
+            <div class="media-info"><span id="media-name">未关联本地文件</span><span id="media-duration">—</span></div>
+            <div class="playback-bar"><button id="play-toggle" class="icon-button" aria-label="播放或暂停">▶</button><button id="step-back" class="icon-button" aria-label="向前步进">‹</button><button id="step-forward" class="icon-button" aria-label="向后步进">›</button><output id="current-time">00:00.000</output><span class="playback-spacer"></span><label class="speed-label">速度<select id="playback-rate"><option value="0.5">0.5×</option><option value="0.75">0.75×</option><option value="1" selected>1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label></div>
+            <label class="sr-only" for="seek">播放位置</label><input id="seek" class="seek" type="range" min="0" max="1" step="0.001" value="0" disabled>
+            <div id="timeline" class="timeline" aria-label="已标记的时间区间"></div>
+            <div class="labels" id="labels" aria-label="证据标签"></div>
+            <div class="marker-bar"><label>起点 / 秒<input id="segment-start" type="number" min="0" step="0.001" placeholder="0.000"></label><button id="mark-start" class="marker-button" title="快捷键 [">[ 标起点</button><label>终点 / 秒<input id="segment-end" type="number" min="0" step="0.001" placeholder="0.000"></label><button id="mark-end" class="marker-button" title="快捷键 ]">] 标终点</button><button id="add-segment" class="primary small">＋ 创建片段</button></div>
+            <div class="segments-heading"><h3>证据片段 <span id="segment-count">0</span></h3><button id="waveform-button" class="text-button" disabled>生成本地波形</button></div><canvas id="waveform" height="96" aria-label="音频波形" hidden></canvas><div id="segment-list" class="segment-list"></div>
+            <div class="task-notes"><label>局部事实草稿<textarea id="fact-notes" rows="2" maxlength="20000" placeholder="记录暂待核验的局部事实"></textarea></label><label>操作备注<textarea id="task-notes" rows="2" maxlength="20000" placeholder="需要审核员关注的问题"></textarea></label></div>
+          </section>
+          <aside class="detail-panel"><div class="detail-top"><span class="eyebrow">SEGMENT DETAILS</span><h3>把观察写清楚。</h3><p>先选择或创建一个证据片段。</p></div><div id="detail-empty" class="detail-empty">片段选中后，可记录主体、观察和证据用途。</div><div id="segment-detail" hidden><div class="detail-summary"><span id="detail-label"></span><span id="detail-time"></span></div><label>主体 ID <span class="required">*</span><input id="subject-id" maxlength="500" placeholder="未知请填 unknown"></label><label>观察内容 <span class="required">*</span><textarea id="observation" rows="5" maxlength="20000" placeholder="只描述看见或听见的内容；人物声称需注明说话人。"></textarea></label><label>证据用途 <span class="required">*</span><select id="evidence-role"><option value="">请选择用途</option><option value="event_support">事件支持</option><option value="emotion_observation">情绪观察</option><option value="both">两者兼有</option><option value="uncertain">暂不确定</option></select></label><label>不确定性<textarea id="uncertainty" rows="3" maxlength="5000" placeholder="遮挡、听不清或其他不确定之处"></textarea></label><button id="delete-segment" class="danger-button">删除这个片段</button></div><div class="detail-tip"><span>LOCAL FIRST</span><p>素材不会上传。浏览器草稿只保存在当前设备；提交飞书前，请先导出本地结果文件。</p></div></aside>
+        </div>
+        <footer class="task-footer"><button id="previous-item" class="secondary small">← 上一条</button><span id="item-position"></span><div><button id="next-item" class="secondary small">下一条 →</button><button id="complete-item" class="primary small">标记完成并继续 ✓</button></div></footer>
+      </div>
+    </section>
+  </main>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  <dialog id="help-dialog"><div class="dialog-top"><span class="eyebrow">QUICK GUIDE</span><button class="close-dialog icon-button" aria-label="关闭使用说明">×</button></div><h2>从本地开始，在本地保存。</h2><ol><li>先从飞书下载分配的素材包，解压后导入其中的任务 JSON。</li><li>点击“选择素材文件夹”，授权浏览器读取这批文件。网页无法直接使用输入的磁盘路径。</li><li>选择证据标签，在播放器暂停位置按 <kbd>[</kbd> 和 <kbd>]</kbd>，再按 <kbd>Enter</kbd> 创建片段。</li><li>填写片段详情，标记任务完成。<kbd>空格</kbd> 控制播放，<kbd>,</kbd> / <kbd>.</kbd> 步进；填写文本时快捷键暂停。</li><li>点击“导出本地结果”。在支持的浏览器中可以选择保存路径；其他浏览器使用下载文件。</li><li>把导出的 JSON 上传到飞书任务表单。复标时使用各自任务 ID，不要互相覆盖结果。</li></ol><p>重新打开网页时可以恢复浏览器草稿，但素材需要重新选择。浏览器缓存可能被清理，导出的 JSON 才是独立文件备份；也可以导入结果继续标注。</p><p>步进在清单有参考帧率时使用该帧率，否则按 0.1 秒移动。可变帧率素材的关键证据请以时间戳为准。</p><a href="./README.md" target="_blank" rel="noopener">完整任务与结果格式说明 ↗</a></dialog>
+  <dialog id="draft-dialog"><div class="dialog-top"><span class="eyebrow">LOCAL DRAFTS</span><button class="close-dialog icon-button" aria-label="关闭草稿列表">×</button></div><h2>继续之前的观察。</h2><div id="draft-list"></div></dialog>
+  <input id="manifest-input" type="file" accept=".json,application/json" hidden>
+  <input id="result-input" type="file" accept=".json,application/json" hidden>
+  <input id="media-input" type="file" accept="video/*,audio/*,.mkv,.flac,.opus" multiple hidden>
+  <input id="folder-input" type="file" webkitdirectory multiple hidden>
+</body>
+</html>
