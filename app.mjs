@@ -1,11 +1,20 @@
 import { LABELS, MAX_JSON_BYTES, MAX_ITEMS, MAX_SEGMENTS, MEDIA_RE, blankRecord, cleanSegment, completionErrors,
-  displayTime, identifier, makeExport, manifestFromFiles, matchFile, newWorkspace, parseManifest, parseResults, safeFilename } from './core.mjs';
-import { listWorkspaces, storeWorkspace } from './storage.mjs';
+  displayTime, editInterval, identifier, makeExport, manifestFromFiles, matchFile, newWorkspace, parseManifest, parseResults, planMediaImport, safeFilename } from './core.mjs';
+import { listWorkspaces, removeWorkspace, storeWorkspace } from './storage.mjs';
 
 const $ = id => document.getElementById(id);
+const SETTINGS_KEY = `bench-settings-v1:${new URL('.', location.href).pathname}`;
+const DEFAULT_SETTINGS = { height: 'auto', fit: 'contain', speed: '1', step: '0.1', export: 'picker' };
+let settings = { ...DEFAULT_SETTINGS };
+try {
+  const saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}');
+  for (const [key, values] of Object.entries({ height: ['auto', '320', '420', '540'], fit: ['contain', 'cover'], speed: ['0.5', '0.75', '1', '1.25', '1.5', '2'], step: ['0.04', '0.1', '0.5', '1'], export: ['picker', 'download'] })) {
+    if (values.includes(saved?.[key])) settings[key] = saved[key];
+  }
+} catch { /* Storage can be unavailable; defaults remain usable. */ }
 let ws = null;
 let selected = null;
-let activeLabel = 'visual_observation';
+let activeLabel = 'unclassified';
 let attached = new Map();
 let mediaURL = null;
 let currentMedia = null;
@@ -14,6 +23,8 @@ let toastTimer;
 let draftTimer;
 let saveQueue = Promise.resolve();
 let busy = false;
+let frameEdit = null;
+let frameSeek = 0;
 const item = () => ws?.manifest.items[ws.index];
 const record = () => ws?.records[item()?.id];
 const segment = () => record()?.segments.find(s => s.id === selected);
@@ -27,7 +38,7 @@ function notify(message, error = false) {
   clearTimeout(toastTimer); $('toast').textContent = message; $('toast').classList.toggle('error', error); $('toast').hidden = false;
   toastTimer = setTimeout(() => { $('toast').hidden = true; }, error ? 12000 : 6000);
 }
-function status(message, error = false) { $('draft-status').textContent = message; $('draft-status').classList.toggle('warning', error); }
+function status(message, error = false) { $('draft-status').textContent = message; if (error) notify(message, true); }
 function run(fn) { return (...args) => Promise.resolve().then(() => fn(...args)).catch(e => notify(e.message || '操作失败，请重试', true)); }
 function enqueueDraft() {
   if (!ws) return Promise.resolve();
@@ -56,23 +67,24 @@ function renderProgress() {
   $('task-count').textContent = ws.manifest.items.length;
   $('progress-label').textContent = `${completed} / ${ws.manifest.items.length} 已完成`;
   $('progress-percent').textContent = `${Math.round(completed / ws.manifest.items.length * 100)}%`;
-  $('item-status').textContent = record().status === 'complete' ? '已完成' : '待标注';
-  $('item-status').classList.toggle('complete', record().status === 'complete');
   renderTaskList();
 }
 function renderTaskList() {
+  const scrollTop = $('task-list').scrollTop;
   const query = $('task-search').value.toLocaleLowerCase();
   const fragment = document.createDocumentFragment();
   for (const [index, task] of ws.manifest.items.entries()) {
     if (query && !`${task.id} ${task.title}`.toLocaleLowerCase().includes(query)) continue;
     const rec = ws.records[task.id];
     const b = el('button', `task-item${index === ws.index ? ' active' : ''}${rec.status === 'complete' ? ' complete' : ''}`);
+    b.dataset.mediaType = task.media_type;
     b.type = 'button'; b.setAttribute('aria-current', index === ws.index ? 'true' : 'false');
     b.append(el('span', 'task-dot', rec.status === 'complete' ? '✓' : String(index + 1).padStart(2, '0')));
     const info = el('span'); info.append(el('span', 'task-name', task.title), el('span', 'task-meta', `${task.media_type === 'video' ? '视频' : '音频'} · ${task.id}`));
     b.append(info); b.addEventListener('click', run(() => switchItem(index))); fragment.append(b);
   }
   $('task-list').replaceChildren(fragment);
+  $('task-list').scrollTop = scrollTop;
 }
 function renderLabels() {
   const fragment = document.createDocumentFragment();
@@ -83,8 +95,7 @@ function renderLabels() {
     b.append(dot, el('span', '', label.name), el('kbd', '', label.key));
     b.addEventListener('click', () => chooseLabel(label.id)); fragment.append(b);
   }
-  const add = el('button', 'text-button', '新片段 ↗'); add.id = 'new-segment'; add.addEventListener('click', newSegment);
-  fragment.append(add); $('labels').replaceChildren(fragment);
+  $('labels').replaceChildren(fragment);
 }
 function chooseLabel(id) {
   if (!ws || !LABELS.some(x => x.id === id) || (item().media_type === 'audio' && id === 'visual_observation')) return;
@@ -93,41 +104,65 @@ function chooseLabel(id) {
   renderLabels();
 }
 function renderTimeline() {
+  if (frameEdit) cancelFrameEdit();
   const frag = document.createDocumentFragment();
   const duration = item()?.duration_s;
+  $('timeline-draw').setAttribute('aria-disabled', String(!loaded));
+  $('timeline-duration').textContent = duration ? `0:00 — ${displayTime(duration)}` : '等待加载素材';
   if (duration) for (const seg of record().segments) {
     const b = el('button', 'timeline-segment' + (seg.id === selected ? ' active' : ''));
+    b.dataset.segmentId = seg.id;
     b.style.left = `${Math.min(100, seg.start_time / duration * 100)}%`;
     b.style.width = `${Math.max(0.2, Math.min(100, (seg.end_time - seg.start_time) / duration * 100))}%`;
     b.style.backgroundColor = LABELS.find(x => x.id === seg.label).color;
     b.title = `${LABELS.find(x => x.id === seg.label).name} ${displayTime(seg.start_time)}–${displayTime(seg.end_time)}`;
-    b.setAttribute('aria-label', b.title); b.addEventListener('click', () => selectSegment(seg.id)); frag.append(b);
+    b.append(el('span', 'timeline-segment-label', LABELS.find(x => x.id === seg.label).name));
+    if (seg.id === selected && loaded) {
+      b.title += ' · 拖动框身整体移动，拖动左右边缘调整起止点';
+      for (const edge of ['start', 'end']) {
+        const handle = el('span', `timeline-handle timeline-handle-${edge}`);
+        handle.dataset.edge = edge; handle.setAttribute('aria-hidden', 'true');
+        b.append(handle);
+      }
+    }
+    b.setAttribute('aria-label', b.title);
+    b.addEventListener('click', e => { if (!e.detail || !loaded) selectSegment(seg.id); });
+    const lane = el('div', 'timeline-lane'); lane.append(b); frag.append(lane);
   }
   $('timeline').replaceChildren(frag);
 }
 function renderSegments() {
+  const scrollTop = $('segment-list').scrollTop;
   $('segment-count').textContent = record().segments.length;
   const fragment = document.createDocumentFragment();
   if (!record().segments.length) fragment.append(el('div', 'empty-segments', '还没有片段。标记起止位置，创建第一条证据。'));
   for (const seg of record().segments) {
     const label = LABELS.find(x => x.id === seg.label);
     const b = el('button', 'segment-row' + (selected === seg.id ? ' active' : '')); b.type = 'button'; b.dataset.segmentId = seg.id;
+    b.style.setProperty('--category-color', label.color);
+    b.style.setProperty('--category-tint', `${label.color}18`);
     const info = el('span'); const main = el('span', 'segment-main'); const dot = el('span', 'label-dot'); dot.style.backgroundColor = label.color;
     main.append(dot, el('span', '', label.name)); info.append(main);
-    if (seg.annotations.observation) info.append(el('div', 'segment-note', seg.annotations.observation));
+    if (seg.annotations.local_fact || seg.annotations.observation) info.append(el('div', 'segment-note', seg.annotations.local_fact || seg.annotations.observation));
+    b.setAttribute('aria-pressed', String(selected === seg.id));
     b.append(info, el('span', 'segment-times', `${displayTime(seg.start_time)} → ${displayTime(seg.end_time)}`));
     b.addEventListener('click', () => selectSegment(seg.id)); fragment.append(b);
   }
-  $('segment-list').replaceChildren(fragment); renderTimeline();
+  $('segment-list').replaceChildren(fragment); $('segment-list').scrollTop = scrollTop; renderTimeline();
 }
 function renderDetail() {
   const seg = segment();
   $('segment-detail').hidden = !seg; $('detail-empty').hidden = Boolean(seg);
-  $('add-segment').textContent = seg ? '更新片段区间' : '＋ 创建片段';
+  $('delete-segment').disabled = !seg;
   if (!seg) return;
   $('detail-label').textContent = LABELS.find(x => x.id === seg.label).name;
+  const category = $('segment-category');
+  category.replaceChildren(...LABELS.filter(l => item().media_type === 'video' || l.id !== 'visual_observation').map(l => {
+    const option = el('option', '', l.name); option.value = l.id; return option;
+  }));
+  category.value = seg.label;
   $('detail-time').textContent = `${displayTime(seg.start_time)} → ${displayTime(seg.end_time)}`;
-  for (const [id, key] of [['subject-id', 'subject_id'], ['observation', 'observation'], ['evidence-role', 'evidence_role'], ['uncertainty', 'uncertainty']]) $(id).value = seg.annotations[key];
+  for (const [id, key] of [['subject-id', 'subject_id'], ['local-fact', 'local_fact'], ['observation', 'observation'], ['evidence-role', 'evidence_role']]) $(id).value = seg.annotations[key] || '';
 }
 function selectSegment(id) {
   selected = id; const seg = segment(); if (!seg) return;
@@ -135,8 +170,42 @@ function selectSegment(id) {
   if (loaded) currentMedia.currentTime = seg.start_time;
   renderLabels(); renderSegments(); renderDetail();
 }
+function previewFrameEdit(times, seek = true) {
+  const edit = frameEdit;
+  edit.preview = times;
+  edit.node.style.left = `${times.start_time / edit.duration * 100}%`;
+  edit.node.style.width = `${Math.max(.2, (times.end_time - times.start_time) / edit.duration * 100)}%`;
+  const text = `${displayTime(times.start_time)} → ${displayTime(times.end_time)}`;
+  $('segment-start').value = times.start_time.toFixed(3); $('segment-end').value = times.end_time.toFixed(3);
+  $('detail-time').textContent = text;
+  const row = [...$('segment-list').children].find(node => node.dataset.segmentId === edit.id);
+  if (row) row.querySelector('.segment-times').textContent = text;
+  $('timeline-selection').textContent = `${text} · 松开保存，Esc 取消`;
+  if (seek && !frameSeek) frameSeek = requestAnimationFrame(() => {
+    frameSeek = 0;
+    if (!frameEdit || !loaded || ws?.id !== edit.workspace || item()?.id !== edit.task) return;
+    const time = edit.mode === 'end' ? edit.preview.end_time : edit.preview.start_time;
+    currentMedia.currentTime = time;
+    $('current-time').textContent = displayTime(time); $('seek').value = time;
+  });
+}
+function cancelFrameEdit() {
+  if (!frameEdit) return;
+  const edit = frameEdit;
+  previewFrameEdit(edit.original, false);
+  cancelAnimationFrame(frameSeek); frameSeek = 0;
+  if (loaded && ws?.id === edit.workspace && item()?.id === edit.task) {
+    currentMedia.currentTime = edit.playhead;
+    $('current-time').textContent = displayTime(edit.playhead); $('seek').value = edit.playhead;
+  }
+  edit.node.classList.remove('dragging');
+  frameEdit = null;
+  if ($('timeline').hasPointerCapture(edit.pointer)) $('timeline').releasePointerCapture(edit.pointer);
+  $('timeline-selection').textContent = '选中时间框后，拖动框身移动；拖动左右边缘调整起止时间。';
+}
 function newSegment() {
   if (!ws) return;
+  activeLabel = 'unclassified';
   selected = null; $('segment-start').value = ''; $('segment-end').value = '';
   renderLabels(); renderSegments(); renderDetail();
 }
@@ -153,21 +222,39 @@ function markEnd() {
 function addSegment() {
   if (!ws || !loaded) throw new Error('请先选择并加载本地素材');
   if ($('segment-start').value === '' || $('segment-end').value === '') throw new Error('请先标记起点和终点');
-  if (!selected && record().segments.length >= MAX_SEGMENTS) throw new Error('单条素材最多支持 1000 个片段，请拆分任务');
+  if (record().segments.length >= MAX_SEGMENTS) throw new Error('单条素材最多支持 1000 个时间窗，请拆分任务');
+  const next = cleanSegment({ id: crypto.randomUUID(), start_time: Number($('segment-start').value), end_time: Number($('segment-end').value),
+    label: 'unclassified', annotations: {} }, item());
+  record().segments.push(next);
+  selected = next.id; activeLabel = next.label; changed(); renderSegments(); renderDetail();
+  $('segment-category').focus();
+  enqueueDraft();
+}
+function updateSelectedTimes() {
   const old = segment();
-  const next = cleanSegment({ id: old?.id || crypto.randomUUID(), start_time: Number($('segment-start').value), end_time: Number($('segment-end').value),
-    label: activeLabel, annotations: old?.annotations || {} }, item());
-  if (old) record().segments[record().segments.indexOf(old)] = next;
-  else record().segments.push(next);
-  selected = next.id; changed(); renderSegments(); renderDetail();
-  if (!old) $('subject-id').focus();
+  if (!old) return;
+  try {
+    if ($('segment-start').value === '' || $('segment-end').value === '') throw new Error('起点和终点不能为空');
+    const next = cleanSegment({ ...old, start_time: Number($('segment-start').value), end_time: Number($('segment-end').value) }, item());
+    if (next.start_time !== old.start_time || next.end_time !== old.end_time) {
+      record().segments[record().segments.indexOf(old)] = next;
+      changed(); renderSegments(); renderDetail();
+      if (loaded) currentMedia.currentTime = next.start_time;
+    }
+    $('time-edit-hint').textContent = '选中时间窗的起止时间已保存。新建将使用当前区间创建独立的空白时间窗。';
+    enqueueDraft();
+  } catch (error) {
+    $('time-edit-hint').textContent = `时间未保存：${error.message}`;
+    notify(error.message, true);
+  }
 }
 function releaseMedia() {
+  cancelFrameEdit();
   loaded = false;
   for (const m of [$('video'), $('audio')]) { m.pause(); m.removeAttribute('src'); m.load(); }
   if (mediaURL) URL.revokeObjectURL(mediaURL);
   mediaURL = null; currentMedia = null;
-  $('waveform').hidden = true; $('waveform-button').disabled = true; $('seek').disabled = true;
+  $('seek').disabled = true;
   $('current-time').textContent = displayTime(0); $('seek').value = 0; $('play-toggle').textContent = '▶';
 }
 function loadMedia() {
@@ -187,11 +274,9 @@ function renderWorkspace() {
   renderCurrent();
 }
 function renderCurrent() {
-  selected = null; activeLabel = item().media_type === 'video' ? 'visual_observation' : 'acoustic_observation';
-  $('item-kind').textContent = item().media_type === 'video' ? 'VIDEO EVIDENCE' : 'AUDIO EVIDENCE';
-  $('item-title').textContent = item().title; $('item-id').textContent = `${item().id} · 原片偏移 ${item().clip_start_s}s`;
+  selected = null; activeLabel = 'unclassified';
+  $('item-title').textContent = item().title;
   $('task-description').textContent = item().text; $('task-description').hidden = !item().text;
-  $('fact-notes').value = record().local_fact_notes; $('task-notes').value = record().task_notes;
   $('segment-start').value = ''; $('segment-end').value = '';
   $('item-position').textContent = `${String(ws.index + 1).padStart(2, '0')} / ${String(ws.manifest.items.length).padStart(2, '0')}`;
   $('previous-item').disabled = ws.index === 0; $('next-item').disabled = ws.index === ws.manifest.items.length - 1;
@@ -225,7 +310,7 @@ async function attachFiles(list) {
   if (!files.length) throw new Error('未找到支持的音视频文件。建议使用 MP4、WebM、WAV 或 MP3');
   if (files.length > MAX_ITEMS) throw new Error('一次最多选择 5000 个素材，请拆分批次');
   if (!ws) { ws = newWorkspace(manifestFromFiles(files)); renderWorkspace(); }
-  let matched = 0; const errors = [];
+  let matched = 0; const errors = []; const matchedIDs = new Set();
   const bindings = new Map(attached);
   for (const task of ws.manifest.items) {
     try {
@@ -235,12 +320,65 @@ async function attachFiles(list) {
       if (old && ws.records[task.id].segments.length && old.size && old.size !== file.size) {
         errors.push(`${task.id}：文件大小与已保存记录不一致，未关联`); continue;
       }
-      bindings.set(task.id, file); matched++;
+      bindings.set(task.id, file); matched++; matchedIDs.add(task.id);
     } catch (e) { errors.push(e.message); }
   }
-  attached = bindings; loadMedia(); await enqueueDraft();
+  if (!matched) throw new Error(errors[0] || '所选素材不匹配当前任务。请用“导入素材”直接建立新的素材任务，或选择清单对应的文件');
+  attached = bindings;
+  if (!matchedIDs.has(item().id)) { ws.index = ws.manifest.items.findIndex(task => matchedIDs.has(task.id)); renderCurrent(); }
+  else loadMedia();
+  await enqueueDraft();
   if (errors.length) notify(`已关联 ${matched} 条任务。\n${errors.slice(0, 3).join('\n')}`, true);
   else notify(`已关联 ${matched} / ${ws.manifest.items.length} 条任务。素材仅在当前浏览器中读取`);
+}
+async function importMediaFiles(list) {
+  const files = Array.from(list).filter(file => MEDIA_RE.test(file.name));
+  if (!files.length) throw new Error('未找到支持的音视频文件。请选择 WAV、MP3、M4A、MP4 或 WebM 等素材');
+  if (files.length > MAX_ITEMS) throw new Error('一次最多选择 5000 个素材，请拆分批次');
+  const plan = planMediaImport(ws?.manifest, files);
+  if (!ws) await activate(newWorkspace(parseManifest({ batch_id: 'local-batch', items: plan.added })));
+  else if (plan.added.length) {
+    ws.manifest.items.push(...plan.added);
+    for (const task of plan.added) ws.records[task.id] = blankRecord(task);
+    changed(false);
+  }
+  let reload = false; const errors = [];
+  for (const { file, ids } of plan.bindings) for (const id of ids) {
+    if (attached.has(id)) continue;
+    const rec = ws.records[id];
+    if (rec.media?.size && rec.segments.length && rec.media.size !== file.size) {
+      errors.push(`${file.name}：文件大小与已有标注记录不一致，未重新关联`); continue;
+    }
+    attached.set(id, file);
+    if (item().id === id) reload = true;
+  }
+  renderProgress();
+  if (reload) loadMedia();
+  await enqueueDraft();
+  notify(`已新增 ${plan.added.length} 条素材，跳过 ${plan.skipped} 条已有素材。${errors.length ? '\n' + errors.join('\n') : ''}`, Boolean(errors.length));
+}
+async function deleteTask() {
+  if (!ws || !item()) return;
+  const workspace = ws, target = item();
+  if (!window.confirm(`从任务清单移除「${target.title}」及其标注？本地原文件不会被删除。`)) return;
+  $('delete-task').disabled = true;
+  try {
+    await enqueueDraft();
+    if (ws !== workspace) return;
+    if (ws.manifest.items.length === 1) {
+      await removeWorkspace(ws);
+      releaseMedia(); ws = null; selected = null; attached = new Map();
+      $('workspace').hidden = true; $('welcome').hidden = false; $('task-search').value = '';
+    } else {
+      const currentID = item().id, index = ws.manifest.items.findIndex(task => task.id === target.id);
+      if (index < 0) return;
+      releaseMedia();
+      ws.manifest.items.splice(index, 1); delete ws.records[target.id]; attached.delete(target.id);
+      ws.index = currentID === target.id ? Math.min(index, ws.manifest.items.length - 1) : ws.manifest.items.findIndex(task => task.id === currentID);
+      changed(false); renderCurrent(); await enqueueDraft();
+    }
+    notify('已从任务清单移除素材及其标注，本地原文件保留');
+  } finally { $('delete-task').disabled = false; }
 }
 async function exportResults(forceDownload = false) {
   if (!ws || busy) return;
@@ -250,7 +388,7 @@ async function exportResults(forceDownload = false) {
   const exportID = ws.id; const revision = ws.revision;
   busy = true; $('export-result').disabled = true; $('download-result').disabled = true;
   try {
-    if (window.showSaveFilePicker && !forceDownload) {
+    if (window.showSaveFilePicker && !forceDownload && settings.export !== 'download') {
       const handle = await window.showSaveFilePicker({ suggestedName: name, types: [{ description: '标注结果 JSON', accept: { 'application/json': ['.json'] } }] });
       const stream = await handle.createWritable(); await stream.write(body); await stream.close();
       notify(`已保存到本地：${handle.name}`);
@@ -285,31 +423,6 @@ async function showDrafts() {
   }
   $('draft-list').replaceChildren(frag); $('draft-dialog').showModal();
 }
-async function generateWaveform() {
-  if (!loaded || !attached.has(item().id)) return;
-  const file = attached.get(item().id);
-  if (file.size > 40 * 1024 * 1024 || currentMedia.duration > 600) throw new Error('本地波形支持不超过 40MB、10 分钟的素材。较长素材请先切片；播放器和区间标注仍可使用');
-  const taskID = item().id; const workspaceID = ws.id;
-  const context = new AudioContext(); $('waveform-button').disabled = true;
-  try {
-    notify('正在本地生成波形，素材不会上传…');
-    const decoded = await context.decodeAudioData(await file.arrayBuffer());
-    if (item()?.id !== taskID || ws?.id !== workspaceID) return;
-    const canvas = $('waveform'); canvas.hidden = false;
-    const width = Math.max(320, Math.round(canvas.getBoundingClientRect().width)); canvas.width = width;
-    const ctx = canvas.getContext('2d'); ctx.clearRect(0, 0, width, 96); ctx.strokeStyle = '#648257'; ctx.lineWidth = 1;
-    const samples = decoded.getChannelData(0); const stride = Math.max(1, Math.floor(samples.length / width));
-    ctx.beginPath();
-    for (let x = 0; x < width; x++) {
-      let low = 0; let high = 0;
-      for (let j = x * stride; j < Math.min(samples.length, (x + 1) * stride); j++) { low = Math.min(low, samples[j]); high = Math.max(high, samples[j]); }
-      ctx.moveTo(x + .5, 48 + low * 44); ctx.lineTo(x + .5, 48 + high * 44);
-    }
-    ctx.stroke(); notify('波形已在本地生成，点击波形可以跳转播放位置');
-  } catch (e) { throw new Error(`无法生成波形：${e.message}。仍可使用播放器和时间区间标注`); }
-  finally { await context.close(); if (item()?.id === taskID && ws?.id === workspaceID) $('waveform-button').disabled = !loaded; }
-}
-
 for (const [mediaID, kind] of [['video', 'video'], ['audio', 'audio']]) {
   const media = $(mediaID);
   media.addEventListener('loadedmetadata', () => {
@@ -323,7 +436,7 @@ for (const [mediaID, kind] of [['video', 'video'], ['audio', 'audio']]) {
     const metadataChanged = item().duration_s !== media.duration || JSON.stringify(record().media) !== JSON.stringify(metadata);
     item().duration_s = media.duration;
     record().media = metadata;
-    loaded = true; $('seek').max = media.duration; $('seek').disabled = false; $('waveform-button').disabled = false;
+    loaded = true; $('seek').max = media.duration; $('seek').disabled = false;
     $('media-duration').textContent = `${displayTime(media.duration)}${item().video_fps ? ` · ${item().video_fps} fps 参考` : ''}`;
     renderTimeline();
     if (metadataChanged) changed(false);
@@ -340,25 +453,27 @@ async function togglePlay() {
 }
 function step(direction) {
   if (!loaded) return;
-  currentMedia.pause(); const delta = item().video_fps ? 1 / item().video_fps : .1;
+  currentMedia.pause(); const delta = item().video_fps ? 1 / item().video_fps : Number(settings.step);
   currentMedia.currentTime = Math.max(0, Math.min(currentMedia.duration, currentMedia.currentTime + delta * direction));
 }
 for (const id of ['import-manifest', 'welcome-manifest']) $(id).addEventListener('click', () => $('manifest-input').click());
 for (const id of ['import-result', 'welcome-result']) $(id).addEventListener('click', () => $('result-input').click());
-for (const id of ['attach-media', 'attach-current', 'welcome-media']) $(id).addEventListener('click', () => $('media-input').click());
+for (const id of ['attach-media', 'welcome-media']) $(id).addEventListener('click', () => $('media-input').click());
+const attachButton = el('button', 'quiet', '关联素材'); attachButton.id = 'attach-existing';
+$('attach-media').after(attachButton);
+for (const id of ['attach-current', 'attach-existing']) $(id).addEventListener('click', () => $('attach-input').click());
 $('attach-folder').addEventListener('click', () => $('folder-input').click());
-for (const [id, fn] of [['manifest-input', files => importManifest(files[0])], ['result-input', files => importResults(files[0])], ['media-input', attachFiles], ['folder-input', attachFiles]]) {
+for (const [id, fn] of [['manifest-input', files => importManifest(files[0])], ['result-input', files => importResults(files[0])], ['media-input', importMediaFiles], ['attach-input', attachFiles], ['folder-input', attachFiles]]) {
   $(id).addEventListener('change', run(async e => { const files = Array.from(e.target.files); e.target.value = ''; if (files.length) await fn(files); }));
 }
 for (const [id, key] of [['batch-id', 'batch_id'], ['assignment-id', 'assignment_id'], ['annotator-id', 'annotator_id']]) {
   $(id).addEventListener('input', run(() => { if (ws) { ws.manifest[key] = identifier($(id).value, key); changed(false); } }));
 }
-for (const [id, key] of [['subject-id', 'subject_id'], ['observation', 'observation'], ['evidence-role', 'evidence_role'], ['uncertainty', 'uncertainty']]) {
+for (const [id, key] of [['subject-id', 'subject_id'], ['local-fact', 'local_fact'], ['observation', 'observation'], ['evidence-role', 'evidence_role']]) {
   const update = () => { if (segment() && segment().annotations[key] !== $(id).value) { segment().annotations[key] = $(id).value; changed(); renderSegments(); } };
   $(id).addEventListener('input', update);
-  $(id).addEventListener('change', update);
+  $(id).addEventListener('change', () => { update(); enqueueDraft(); });
 }
-for (const [id, key] of [['fact-notes', 'local_fact_notes'], ['task-notes', 'task_notes']]) $(id).addEventListener('input', () => { if (ws) { record()[key] = $(id).value; changed(); } });
 $('task-search').addEventListener('input', () => { if (ws) renderTaskList(); });
 $('previous-item').addEventListener('click', run(() => switchItem(ws.index - 1)));
 $('next-item').addEventListener('click', run(() => switchItem(ws.index + 1)));
@@ -367,23 +482,142 @@ $('export-result').addEventListener('click', exportResultsHandler);
 $('download-result').addEventListener('click', () => { exportResults(true).catch(e => notify(e.message, true)); });
 function exportResultsHandler() { exportResults().catch(e => notify(e.message, true)); }
 $('drafts-button').addEventListener('click', run(showDrafts));
-$('mark-start').addEventListener('click', markStart); $('mark-end').addEventListener('click', markEnd);
+$('delete-task').addEventListener('click', run(deleteTask));
+for (const id of ['segment-start', 'segment-end']) $(id).addEventListener('change', updateSelectedTimes);
 $('add-segment').addEventListener('click', run(addSegment));
 $('delete-segment').addEventListener('click', () => {
   if (!segment()) return;
-  if (!window.confirm('删除这个证据片段及其详情？')) return;
+  if (!window.confirm('删除选中的时间窗及其标注内容？')) return;
   record().segments = record().segments.filter(s => s.id !== selected); selected = null; changed(); renderSegments(); renderDetail();
+  enqueueDraft();
 });
 $('play-toggle').addEventListener('click', run(togglePlay));
 $('step-back').addEventListener('click', () => step(-1)); $('step-forward').addEventListener('click', () => step(1));
 $('seek').addEventListener('input', () => { if (loaded) currentMedia.currentTime = Number($('seek').value); });
 $('playback-rate').addEventListener('change', () => { if (currentMedia) currentMedia.playbackRate = Number($('playback-rate').value); });
-$('waveform-button').addEventListener('click', run(generateWaveform));
-$('waveform').addEventListener('click', e => { if (loaded) { const rect = e.target.getBoundingClientRect(); currentMedia.currentTime = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)) * currentMedia.duration; } });
 $('help-button').addEventListener('click', () => $('help-dialog').showModal());
+$('segment-category').addEventListener('change', () => chooseLabel($('segment-category').value));
+const draw = $('timeline-draw');
+let drag = null;
+function timeAt(x) {
+  const rect = draw.getBoundingClientRect();
+  return Math.max(0, Math.min(1, (x - rect.left) / rect.width)) * currentMedia.duration;
+}
+draw.addEventListener('pointerdown', e => {
+  if (!loaded || e.button !== 0) return;
+  currentMedia.pause();
+  drag = { pointer: e.pointerId, x: e.clientX, time: timeAt(e.clientX), task: item().id };
+  draw.setPointerCapture(e.pointerId);
+});
+draw.addEventListener('pointermove', e => {
+  if (!drag || e.pointerId !== drag.pointer || !loaded) return;
+  const a = Math.min(drag.time, timeAt(e.clientX)), b = Math.max(drag.time, timeAt(e.clientX));
+  const preview = $('timeline-preview'); preview.hidden = false;
+  preview.style.left = `${a / currentMedia.duration * 100}%`;
+  preview.style.width = `${(b - a) / currentMedia.duration * 100}%`;
+  $('timeline-selection').textContent = `${displayTime(a)} → ${displayTime(b)} · 松开创建时间框`;
+});
+function cancelDrag() {
+  drag = null; $('timeline-preview').hidden = true;
+  $('timeline-selection').textContent = '拖动创建时间框；选中列表中的框后修改类别。';
+}
+draw.addEventListener('pointerup', run(e => {
+  if (!drag || e.pointerId !== drag.pointer) return;
+  const start = drag; const end = loaded ? timeAt(e.clientX) : 0;
+  cancelDrag();
+  if (!loaded || item().id !== start.task) return;
+  if (Math.abs(e.clientX - start.x) < 5) { currentMedia.currentTime = end; return; }
+  const a = Math.round(Math.min(start.time, end) * 1000) / 1000;
+  const b = Math.round(Math.max(start.time, end) * 1000) / 1000;
+  if (b <= a) return;
+  newSegment(); $('segment-start').value = a; $('segment-end').value = b;
+  addSegment();
+}));
+draw.addEventListener('pointercancel', cancelDrag);
+draw.addEventListener('lostpointercapture', () => { if (drag) cancelDrag(); });
+const timeline = $('timeline');
+timeline.addEventListener('pointerdown', e => {
+  const target = e.target.closest('.timeline-segment');
+  if (!target || e.button !== 0 || !loaded || frameEdit) return;
+  e.preventDefault();
+  const mode = e.target.closest('[data-edge]')?.dataset.edge || 'move';
+  const id = target.dataset.segmentId;
+  if (selected !== id) selectSegment(id);
+  const node = [...timeline.querySelectorAll('.timeline-segment')].find(b => b.dataset.segmentId === id);
+  const original = segment();
+  if (!node || !original) return;
+  currentMedia.pause(); node.focus({ preventScroll: true });
+  frameEdit = { id, pointer: e.pointerId, x: e.clientX, mode, node,
+    original: { start_time: original.start_time, end_time: original.end_time },
+    preview: { start_time: original.start_time, end_time: original.end_time },
+    width: node.parentElement.getBoundingClientRect().width, duration: item().duration_s,
+    workspace: ws.id, task: item().id, moved: false, playhead: currentMedia.currentTime };
+  timeline.setPointerCapture(e.pointerId);
+});
+function updateFrameEdit(e) {
+  if (!frameEdit || frameEdit.pointer !== e.pointerId) return;
+  const edit = frameEdit;
+  if (!edit.moved && Math.abs(e.clientX - edit.x) < 3) return;
+  edit.moved = true; edit.node.classList.add('dragging');
+  previewFrameEdit(editInterval(edit.original, (e.clientX - edit.x) / edit.width * edit.duration, edit.mode, edit.duration));
+}
+timeline.addEventListener('pointermove', updateFrameEdit);
+timeline.addEventListener('pointerup', e => {
+  if (!frameEdit || frameEdit.pointer !== e.pointerId) return;
+  updateFrameEdit(e);
+  const edit = frameEdit; const nextTimes = edit.preview;
+  cancelFrameEdit();
+  if (ws?.id !== edit.workspace || item()?.id !== edit.task) return;
+  if (!edit.moved) { if (loaded) currentMedia.currentTime = edit.mode === 'end' ? edit.original.end_time : edit.original.start_time; return; }
+  const old = record().segments.find(s => s.id === edit.id);
+  if (!old || (old.start_time === nextTimes.start_time && old.end_time === nextTimes.end_time)) return;
+  try {
+    const next = cleanSegment({ ...old, ...nextTimes }, item());
+    record().segments[record().segments.indexOf(old)] = next;
+    changed(); renderSegments(); renderDetail();
+    $('segment-start').value = next.start_time.toFixed(3); $('segment-end').value = next.end_time.toFixed(3);
+    currentMedia.currentTime = edit.mode === 'end' ? next.end_time : next.start_time;
+  } catch (error) { notify(error.message, true); }
+});
+timeline.addEventListener('pointercancel', cancelFrameEdit);
+timeline.addEventListener('lostpointercapture', cancelFrameEdit);
+const setupButton = el('button', 'quiet', '设置');
+setupButton.id = 'settings-button';
+document.querySelector('.top-actions').prepend(setupButton);
+function applySettings() {
+  const stage = document.querySelector('.media-stage');
+  stage.style.height = settings.height === 'auto' ? '' : `${settings.height}px`;
+  $('video').style.objectFit = settings.fit;
+  $('playback-rate').value = settings.speed;
+  if (currentMedia) currentMedia.playbackRate = Number(settings.speed);
+}
+function fillSettings() {
+  for (const key of Object.keys(DEFAULT_SETTINGS)) $(`setting-${key}`).value = settings[key];
+}
+setupButton.addEventListener('click', () => {
+  fillSettings();
+  $('deployment-mode').textContent = ['127.0.0.1', 'localhost', '[::1]'].includes(location.hostname)
+    ? `本机运行 · ${location.origin} · 素材与结果保留在本机`
+    : '浏览器本地文件模式 · 素材与结果保留在当前设备';
+  $('setup-input-summary').textContent = ws ? `当前任务 ${ws.manifest.items.length} 条，已关联本地素材 ${attached.size} 条。` : '尚未导入任务。也可以在首页直接选择音视频，自动建立任务。';
+  $('settings-dialog').showModal();
+});
+for (const [button, input] of [['setup-manifest', 'manifest-input'], ['setup-folder', 'folder-input'], ['setup-result', 'result-input']]) {
+  $(button).addEventListener('click', () => { $('settings-dialog').close(); $(input).click(); });
+}
+$('save-settings').addEventListener('click', () => {
+  for (const key of Object.keys(DEFAULT_SETTINGS)) settings[key] = $(`setting-${key}`).value;
+  applySettings();
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); notify('设置已保存并应用'); }
+  catch { notify('设置已应用，但当前浏览器无法持久保存设置', true); }
+  $('settings-dialog').close();
+});
+$('reset-settings').addEventListener('click', () => { for (const key of Object.keys(DEFAULT_SETTINGS)) $(`setting-${key}`).value = DEFAULT_SETTINGS[key]; });
+applySettings();
 document.querySelectorAll('.close-dialog').forEach(b => b.addEventListener('click', () => b.closest('dialog').close()));
 document.querySelectorAll('dialog').forEach(d => d.addEventListener('click', e => { if (e.target === d && e.offsetX >= 0 && e.offsetY >= 0) { const r = d.getBoundingClientRect(); if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) d.close(); } }));
 document.addEventListener('keydown', e => {
+  if (frameEdit) { if (e.key === 'Escape') { e.preventDefault(); cancelFrameEdit(); } return; }
   if (!ws || e.ctrlKey || e.metaKey || e.altKey || e.target.closest('input,textarea,select,[contenteditable="true"]') || document.querySelector('dialog[open]')) return;
   if (e.key === '[') { e.preventDefault(); markStart(); }
   else if (e.key === ']') { e.preventDefault(); markEnd(); }

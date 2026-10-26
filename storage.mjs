@@ -39,3 +39,20 @@ export async function listWorkspaces() {
     req.onerror = () => reject(req.error);
   });
 }
+export async function removeWorkspace(workspace) {
+  const db = await database();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('workspaces', 'readwrite'), store = tx.objectStore('workspaces');
+    let failure;
+    const current = store.get(workspace.id);
+    current.onsuccess = () => {
+      const existing = current.result;
+      if (existing && existing._writer !== WRITER && existing._storage_token !== workspace._storage_token) {
+        failure = new Error('该任务已在另一个标签页更新，无法删除旧草稿。请先恢复最新草稿'); tx.abort(); return;
+      }
+      store.delete(workspace.id);
+    };
+    tx.oncomplete = () => resolve();
+    tx.onerror = tx.onabort = () => reject(failure || tx.error || new Error('草稿移除失败'));
+  });
+}

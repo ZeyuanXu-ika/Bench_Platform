@@ -3,13 +3,14 @@ export const MAX_JSON_BYTES = 20 * 1024 * 1024;
 export const MAX_ITEMS = 5000;
 export const MAX_SEGMENTS = 1000;
 export const LABELS = [
+  { id: 'unclassified', name: '待分类', color: '#687684', key: '0' },
   { id: 'visual_observation', name: '视觉观察', color: '#377860', key: '1' },
   { id: 'speech_content', name: '言语内容', color: '#4d73a0', key: '2' },
   { id: 'acoustic_observation', name: '声学观察', color: '#b37a2f', key: '3' },
   { id: 'other', name: '其他证据', color: '#8c6c84', key: '4' },
 ];
 export const ROLES = ['event_support', 'emotion_observation', 'both', 'uncertain'];
-export const MEDIA_RE = /\.(mp4|webm|mov|m4v|wav|mp3|ogg|oga|flac|m4a|aac|opus)$/i;
+export const MEDIA_RE = /\.(mp4|webm|mov|m4v|wav|mp3|ogg|oga|flac|m4a|aac|opus|weba)$/i;
 const VIDEO_RE = /\.(mp4|webm|mov|m4v)$/i;
 
 export function text(value, name, max = 20000, fallback = '') {
@@ -88,16 +89,31 @@ export function cleanSegment(raw, item) {
   const role = text(a.evidence_role, '证据用途', 50);
   if (role && !ROLES.includes(role)) throw new Error('证据用途不受支持');
   return { id: identifier(raw.id, '片段 ID') || crypto.randomUUID(), start_time: start, end_time: end, label: raw.label,
-    annotations: { subject_id: text(a.subject_id, '主体 ID', 500), observation: text(a.observation, '观察内容'),
+    annotations: { subject_id: text(a.subject_id, '主体 ID', 500), observation: text(a.observation, '观察内容'), local_fact: text(a.local_fact, '局部事实'),
       evidence_role: role, uncertainty: text(a.uncertainty, '不确定性', 5000) } };
+}
+export function editInterval(segment, delta, mode, duration) {
+  if (!Number.isFinite(delta) || !Number.isFinite(duration) || duration <= 0) throw new Error('无效的时间轴位置');
+  const clamp = (value, low, high) => Math.max(low, Math.min(high, value));
+  const round = value => Math.round(value * 1000) / 1000;
+  let start = segment.start_time, end = segment.end_time;
+  if (mode === 'move') {
+    const length = end - start;
+    start = clamp(round(start + delta), 0, Math.max(0, duration - length));
+    end = start + length;
+  } else if (mode === 'start') start = clamp(round(start + delta), 0, Math.max(0, end - .001));
+  else if (mode === 'end') end = clamp(round(end + delta), Math.min(duration, start + .001), duration);
+  else throw new Error('无效的时间框操作');
+  return { start_time: start, end_time: end };
 }
 export function completionErrors(item, record) {
   const errors = [];
   if (!record.segments.length) errors.push('至少创建一条证据片段');
   for (const [i, seg] of record.segments.entries()) {
+    if (seg.label === 'unclassified') errors.push(`片段 ${i + 1}：请选择归属类别`);
     try { cleanSegment(seg, item); } catch (e) { errors.push(`片段 ${i + 1}：${e.message}`); }
     if (!seg.annotations.subject_id.trim()) errors.push(`片段 ${i + 1}：填写主体 ID，未知可填 unknown`);
-    if (!seg.annotations.observation.trim()) errors.push(`片段 ${i + 1}：填写观察内容`);
+    if (!(seg.annotations.local_fact || '').trim() && !(seg.annotations.observation || '').trim()) errors.push(`片段 ${i + 1}：填写局部事实或观察内容`);
     if (!seg.annotations.evidence_role) errors.push(`片段 ${i + 1}：选择证据用途`);
   }
   return errors;
@@ -146,9 +162,34 @@ export function matchFile(item, files) {
 export function manifestFromFiles(files) {
   const items = files.map(f => {
     const path = mediaPath(f.webkitRelativePath || f.name);
-    return { id: path, title: f.name, media_path: path, media_type: VIDEO_RE.test(path) ? 'video' : 'audio', source_id: path, clip_start_s: 0, duration_s: null, video_fps: null, text: '' };
+    return { id: path, title: f.name, media_path: path, media_type: f.type?.startsWith('audio/') ? 'audio' : VIDEO_RE.test(path) ? 'video' : 'audio', source_id: path, clip_start_s: 0, duration_s: null, video_fps: null, text: '' };
   });
   return parseManifest({ batch_id: 'local-batch', items });
+}
+export function planMediaImport(manifest, files) {
+  const items = [...(manifest?.items || [])];
+  const added = [], bindings = [];
+  const ids = new Set(items.map(task => task.id));
+  const pathOf = value => value.replaceAll('\\', '/').toLocaleLowerCase();
+  let skipped = 0;
+  for (const file of files) {
+    const candidate = manifestFromFiles([file]).items[0];
+    const path = pathOf(candidate.media_path);
+    let matches = items.filter(task => path === pathOf(task.media_path) || path.endsWith('/' + pathOf(task.media_path)));
+    if (!matches.length && !file.webkitRelativePath) {
+      matches = items.filter(task => pathOf(task.media_path).split('/').pop() === path);
+      if (new Set(matches.map(task => pathOf(task.media_path))).size > 1) throw new Error(`${file.name} 对应多个不同路径，请选择所属素材文件夹后导入`);
+    }
+    if (matches.length) {
+      skipped++; bindings.push({ file, ids: matches.map(task => task.id) }); continue;
+    }
+    const base = candidate.id; let suffix = 2;
+    while (ids.has(candidate.id)) candidate.id = `${base.slice(0, 185)}_${suffix++}`;
+    ids.add(candidate.id); items.push(candidate); added.push(candidate);
+    bindings.push({ file, ids: [candidate.id] });
+  }
+  if (items.length > MAX_ITEMS) throw new Error(`补充后超过 ${MAX_ITEMS} 条任务，请拆分批次`);
+  return { added, bindings, skipped };
 }
 export function safeFilename(s) {
   return String(s).replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_').replace(/[. ]+$/g, '').slice(0, 80) || 'result';
