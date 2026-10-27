@@ -1,5 +1,5 @@
-const CACHE = 'bench-platform-code-v2';
-const FILES = ['./', './index.html', './styles.css', './graph-ui.css', './app.mjs', './core.mjs', './graph.mjs', './graph-ui.mjs', './storage.mjs', './favicon.svg', './README.md'];
+const CACHE = 'bench-platform-code-v2.1';
+const FILES = ['./', './index.html', './styles.css', './graph-ui.css', './app.mjs', './core.mjs', './graph.mjs', './graph-view.mjs', './graph-ui.mjs', './storage.mjs', './favicon.svg', './README.md'];
 const ALLOWED = new Set(FILES.map(x => new URL(x, self.registration.scope).pathname));
 self.addEventListener('install', event => {
   event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(FILES)).then(() => self.skipWaiting()));

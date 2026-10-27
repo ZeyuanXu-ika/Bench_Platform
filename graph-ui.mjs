@@ -1,4 +1,5 @@
 import { blankGraph, evidenceNodes, evidenceBounds, normalizeGraph, graphIssues, invalidateEvidence, removeGraphNode } from './graph.mjs';
+import { graphViewLinks, projectGraphView, serializeFullGraphSVG } from './graph-view.mjs';
 
 const STAGES = [['evidence', '证据'], ['facts', '事实'], ['events', '复合事件'], ['emotions', '情感脉络'], ['graph', '关联图谱']];
 const COLLECTION = { entity: 'entities', mention: 'mentions', fact: 'facts', event: 'events', emotion_state: 'emotion_states', emotion_transition: 'emotion_transitions' };
@@ -15,6 +16,7 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
   root.classList.add('graph-workbench');
   let activeStage = 'evidence';
   let graphFit = true;
+  let graphPage = 0;
   const selected = { entity: '', mention: '', fact: '', event: '', emotion_state: '', emotion_transition: '' };
   let factSeed = null, graphFocus = null, showManagement = false;
   const fieldDrafts = new Map(), fieldBaselines = new Map(), dirtyFields = new Set(); let renderedContext = null, savingContext = null;
@@ -182,15 +184,34 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
     form.addEventListener('input', update); form.addEventListener('change', update);
   }
   function requireValue(ok, message) { if (!ok) throw new Error(message); }
+  const sameMembers = (left = [], right = []) => { const sorted = [...right].sort(); return left.length === sorted.length && [...left].sort().every((value, index) => value === sorted[index]); };
+  function nodeSignature(entry, includeReview = false) {
+    if (!entry) return '';
+    return JSON.stringify(Object.fromEntries(Object.keys(entry).filter(key => includeReview || key !== 'review_status').sort().map(key => [key,
+      ['aliases', 'subject_ids'].includes(key) ? [...entry[key]].sort() : entry[key]])));
+  }
+  function graphSignature(value) {
+    const result = {};
+    for (const [key, entries] of Object.entries(value)) {
+      if (key === 'status') continue;
+      result[key] = entries.map(entry => key === 'links'
+        ? JSON.stringify([entry.from_type, entry.from_id, entry.to_type, entry.to_id, entry.type])
+        : nodeSignature(entry, true)).sort();
+    }
+    return JSON.stringify(result);
+  }
   function changedGraph(mutator, message, context = savingContext) {
     const workspace = ws(), previous = structuredClone(workspace.graph);
     try {
       captureFields();
       workspace.graph.status = 'draft'; mutator();
+      const modified = graphSignature(previous) !== graphSignature(workspace.graph);
+      if (!modified) workspace.graph.status = previous.status;
       workspace.graph = normalizeGraph(workspace.graph, workspace);
       if (context) clearFormContext(context.type, context.id);
       pruneRemovedContexts(); renderedContext = null;
-      Promise.resolve(changed()).catch(error => report(error.message || '浏览器草稿保存失败，请导出结果', true)); render(); report(message);
+      if (modified) Promise.resolve(changed()).catch(error => report(error.message || '浏览器草稿保存失败，请导出结果', true));
+      render(); report(message);
     } catch (error) { workspace.graph = previous; report(error.message || '修改未保存，请检查字段', true); }
   }
   function markDependents(type, id) {
@@ -207,12 +228,14 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
     }
   }
   function replaceLinks(toType, toID, fromType, ids, type) {
+    const existing = linksTo(toType, toID, fromType), unique = [...new Set(ids)];
+    if (sameMembers(existing.map(link => link.from_id), unique) && existing.every(link => link.type === type)) return;
     graph().links = graph().links.filter(link => !(link.to_type === toType && link.to_id === toID && link.from_type === fromType));
-    for (const id of new Set(ids)) graph().links.push({ id: crypto.randomUUID(), from_type: fromType, from_id: id, to_type: toType, to_id: toID, type });
+    for (const id of unique) graph().links.push({ id: existing.find(link => link.from_id === id)?.id || crypto.randomUUID(), from_type: fromType, from_id: id, to_type: toType, to_id: toID, type });
   }
   function upsert(type, entry) {
     const list = graph()[COLLECTION[type]], index = list.findIndex(current => current.id === entry.id);
-    if (index >= 0) list[index] = entry; else list.push(entry);
+    if (index >= 0) { if (nodeSignature(list[index], true) !== nodeSignature(entry, true)) list[index] = entry; } else list.push(entry);
     selected[type] = entry.id;
   }
   function remove(type, id) {
@@ -292,7 +315,7 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
     entityActions.append(button('保存主体', () => changedGraph(() => {
       requireValue(name.value.trim(), '请填写主体名称');
       const entry = { id: current?.id || crypto.randomUUID(), name: name.value.trim(), aliases: [...new Set(aliases.value.split(/[,，\n]/).map(text => text.trim()).filter(Boolean))] };
-      if (current) {
+      if (current && nodeSignature(current) !== nodeSignature(entry)) {
         for (const fact of graph().facts.filter(fact => fact.subject_ids.includes(current.id) || fact.speaker_id === current.id)) { fact.review_status = 'needs_review'; markDependents('fact', fact.id); }
         for (const state of graph().emotion_states.filter(state => state.subject_id === current.id)) { state.review_status = 'needs_review'; markDependents('emotion_state', state.id); }
       }
@@ -306,8 +329,9 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
     mentions.append(field('提及描述', input('g-mention-description', mention?.description || '', 'text')), field('指向主体', select('g-mention-entity', [{ value: '', label: '请选择主体' }, ...entityOptions()], mention?.entity_id || '')), field('提及出现的证据窗', select('g-mention-evidence', [{ value: '', label: '请选择证据' }, ...evidenceOptions()], mention?.evidence_id || '')));
     const mentionActions = node('div', 'g-actions'); mentionActions.append(button(mention ? '更新提及' : '新增提及', () => changedGraph(() => {
       requireValue(value('g-mention-description').trim() && value('g-mention-entity') && value('g-mention-evidence'), '请填写提及描述、主体和证据窗');
-      if (mention) for (const fact of graph().facts.filter(fact => fact.subject_ids.includes(mention.entity_id) || fact.subject_ids.includes(value('g-mention-entity')) || fact.speaker_id === mention.entity_id || fact.speaker_id === value('g-mention-entity'))) { fact.review_status = 'needs_review'; markDependents('fact', fact.id); }
-      upsert('mention', { id: mention?.id || crypto.randomUUID(), description: value('g-mention-description').trim(), entity_id: value('g-mention-entity'), evidence_id: value('g-mention-evidence') });
+      const entry = { id: mention?.id || crypto.randomUUID(), description: value('g-mention-description').trim(), entity_id: value('g-mention-entity'), evidence_id: value('g-mention-evidence') };
+      if (mention && nodeSignature(mention) !== nodeSignature(entry)) for (const fact of graph().facts.filter(fact => fact.subject_ids.includes(mention.entity_id) || fact.subject_ids.includes(entry.entity_id) || fact.speaker_id === mention.entity_id || fact.speaker_id === entry.entity_id)) { fact.review_status = 'needs_review'; markDependents('fact', fact.id); }
+      upsert('mention', entry);
     }, '主体提及已保存', { type: 'mention', id: mention?.id || '' })));
     if (mention) mentionActions.append(button('取消编辑', () => { selected.mention = ''; render(); })); mentions.append(mentionActions);
     const mentionList = node('div', 'g-compact-list');
@@ -331,6 +355,9 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
         try {
           captureFields();
           requireValue(timeline.value.trim(), '时间轴 ID 不能为空'); requireValue(offset.value !== '' && Number.isFinite(Number(offset.value)), '偏移必须为有效秒数');
+          if (timeline.value.trim() === (item.timeline_id || item.source_id || item.id) && Number(offset.value) === (item.time_offset_s ?? item.clip_start_s ?? 0)) {
+            clearFormContext('alignment', '', item.id); renderedContext = null; render(); report('媒体对齐未变化，已有复核状态保留'); return;
+          }
           item.timeline_id = timeline.value.trim(); item.time_offset_s = Number(offset.value);
           graph().status = 'draft'; invalidateEvidence(ws(), evidence().filter(entry => entry.item_id === item.id).map(entry => entry.id));
           for (const event of graph().events) {
@@ -363,12 +390,13 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
       const text = value('g-fact-text').trim(), subjects = values('g-fact-subjects'), evidenceIDs = values('g-fact-evidence'), kind = value('g-fact-kind'), speaker = value('g-fact-speaker');
       requireValue(text, '请填写事实描述'); requireValue(subjects.length, '请至少选择一个主体'); requireValue(evidenceIDs.length, '请选择支持事实的证据窗');
       if (kind === 'reported_speech') requireValue(speaker, '陈述事实必须注明说话主体');
-      const id = fact?.id || crypto.randomUUID(); if (fact) markDependents('fact', id);
-      upsert('fact', { id, text, subject_ids: subjects, kind, speaker_id: kind === 'reported_speech' ? speaker : '', review_status: value('g-fact-review') });
+      const id = fact?.id || crypto.randomUUID(), entry = { id, text, subject_ids: subjects, kind, speaker_id: kind === 'reported_speech' ? speaker : '', review_status: value('g-fact-review') };
+      if (fact && (nodeSignature(fact) !== nodeSignature(entry) || !sameMembers(refs, evidenceIDs))) markDependents('fact', id);
+      upsert('fact', entry);
       replaceLinks('fact', id, 'evidence', evidenceIDs, 'supports'); factSeed = null;
     }, '事实已保存，引用关系可在关联图谱中查看'));
     partitionForm(form, 'fact', ['g-fact-kind', 'g-fact-subjects', 'g-fact-speaker', 'g-fact-review']);
-    layout.append(form); return layout;
+    layout.prepend(form); return layout;
   }
 
   function eventsPanel() {
@@ -386,12 +414,13 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
       const title = value('g-event-title').trim(), subjects = values('g-event-subjects'), facts = values('g-event-facts');
       requireValue(title && subjects.length && facts.length, '请填写事件描述，并选择参与主体及构成事实');
       const bounds = boundsForFacts(facts); requireValue(bounds, '所选事实缺少证据，无法确定事件时间轴');
-      const id = event?.id || crypto.randomUUID(); if (event) markDependents('event', id);
-      upsert('event', { id, title, subject_ids: subjects, timeline_id: bounds.timeline_id, review_status: value('g-event-review') });
+      const id = event?.id || crypto.randomUUID(), entry = { id, title, subject_ids: subjects, timeline_id: bounds.timeline_id, review_status: value('g-event-review') };
+      if (event && (nodeSignature(event) !== nodeSignature(entry) || !sameMembers(refs, facts))) markDependents('event', id);
+      upsert('event', entry);
       replaceLinks('event', id, 'fact', facts, 'constitutes');
     }, '复合事件已保存，支持证据覆盖范围已更新'));
     partitionForm(form, 'event', ['g-event-subjects', 'g-event-review']);
-    layout.append(form); queueMicrotask(() => { if (activeStage === 'events') updateTiming(); }); return layout;
+    layout.prepend(form); queueMicrotask(() => { if (activeStage === 'events') updateTiming(); }); return layout;
   }
 
   function emotionsPanel() {
@@ -416,13 +445,14 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
       const subject = value('g-state-subject'), label = value('g-state-label').trim(), timeline = value('g-state-timeline'), start = value('g-state-start'), end = value('g-state-end'), facts = values('g-state-facts'), events = values('g-state-events');
       requireValue(subject && label && timeline && start !== '' && end !== '' && facts.length, '请填写主体、情感、时间和事实依据');
       requireValue(Number.isFinite(Number(start)) && Number.isFinite(Number(end)) && Number(end) > Number(start), '情感状态的终点必须大于起点');
-      const id = state?.id || crypto.randomUUID(); if (state) markDependents('emotion_state', id);
-      upsert('emotion_state', { id, subject_id: subject, label, timeline_id: timeline, start_time: Number(start), end_time: Number(end), intensity: value('g-state-intensity') === '' ? null : Number(value('g-state-intensity')), review_status: value('g-state-review') });
+      const id = state?.id || crypto.randomUUID(), entry = { id, subject_id: subject, label, timeline_id: timeline, start_time: Number(start), end_time: Number(end), intensity: value('g-state-intensity') === '' ? null : Number(value('g-state-intensity')), review_status: value('g-state-review') };
+      if (state && (nodeSignature(state) !== nodeSignature(entry) || !sameMembers(refs, facts) || !sameMembers(stateEvents, events))) markDependents('emotion_state', id);
+      upsert('emotion_state', entry);
       replaceLinks('emotion_state', id, 'fact', facts, 'grounds');
       replaceLinks('emotion_state', id, 'event', events, 'associated_with');
     }, '情感状态已保存'));
     partitionForm(form, 'emotion_state', ['g-state-subject', 'g-state-label', 'g-state-intensity', 'g-state-review']);
-    stateLayout.append(form); panel.append(stateLayout);
+    stateLayout.prepend(form); panel.append(stateLayout);
 
     const transitionLayout = node('div', 'g-editor-layout'); transitionLayout.append(nodeList('emotion_transition', '情感变化'));
     const transitionForm = node('div', 'g-card g-form'), transition = find('emotion_transition', selected.emotion_transition);
@@ -436,17 +466,66 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
     const initialStates = graph().emotion_states.filter(entry => entry.subject_id === selectedSubject).map(entry => ({ value: entry.id, label: `${entry.label} · ${entry.timeline_id} · ${rangeText(entry)}` }));
     statePair.append(field('变化前的状态', select('g-transition-from', [{ value: '', label: '请选择状态' }, ...initialStates], transition?.from_state_id || '')), field('变化后的状态', select('g-transition-to', [{ value: '', label: '请选择状态' }, ...initialStates], transition?.to_state_id || ''))); transitionForm.append(statePair);
     subject.addEventListener('change', () => { for (const id of ['g-transition-from', 'g-transition-to']) { const old = root.querySelector(`#${id}`); old.replaceChildren(...select('unused', [{ value: '', label: '请选择状态' }, ...states()]).children); } });
-    transitionForm.append(field('关联事件', select('g-transition-events', eventOptions(), eventLinks.map(link => link.from_id), true), multipleHint), field('事件与情感变化的关系', select('g-transition-relation', [{ value: 'associated_with', label: '关联：不作因果断言' }, { value: 'causes', label: '因果判断（需填写依据）' }], eventLinks.some(link => link.type === 'causes') ? 'causes' : 'associated_with')), field('变化说明 / 因果判断依据', textarea('g-transition-note', transition?.note || '', 3)), reviewField('g-transition', transition?.review_status));
+    const relationOptions = [{ value: 'associated_with', label: '关联：不作因果断言' }, { value: 'causes', label: '因果判断（需填写依据）' }];
+    const eventPicker = select('g-transition-events', eventOptions(), eventLinks.map(link => link.from_id), true);
+    const eventSelect = eventPicker.querySelector('select');
+    const relation = select('g-transition-relation', relationOptions, eventLinks[0]?.type || 'associated_with');
+    const relationField = field('事件与情感变化的关系', relation);
+    const relations = node('section', 'g-event-relation-list'); relations.id = 'g-transition-event-relations';
+    const eventRelationValues = new Map(eventLinks.map(link => [link.from_id, link.type]));
+    const eventRelationControls = new Map();
+    let previousEvents = [...eventSelect.selectedOptions].map(option => option.value);
+    const relationID = id => 'g-transition-event-relation-' + [...new TextEncoder().encode(id)].map(byte => byte.toString(16).padStart(2, '0')).join('');
+    const context = () => ({ workspace: ws().id, selected: { ...selected } });
+    function syncEventRelations(restoreDrafts = true) {
+      if (previousEvents.length === 1) eventRelationValues.set(previousEvents[0], relation.value);
+      if (previousEvents.length > 1) for (const [id, control] of eventRelationControls) eventRelationValues.set(id, control.value);
+      const ids = [...eventSelect.selectedOptions].map(option => option.value);
+      for (const [id, control] of eventRelationControls) if (!ids.includes(id)) dirtyFields.delete(draftKey(control, context()));
+      relations.replaceChildren(node('p', 'g-hint', '每个事件分别选择关联或因果；新增关联默认不作因果断言。'));
+      eventRelationControls.clear();
+      for (const id of ids) {
+        const initial = eventLinks.find(link => link.from_id === id)?.type || 'associated_with';
+        const control = select(relationID(id), relationOptions, eventRelationValues.get(id) || initial);
+        control.dataset.eventId = id;
+        const key = draftKey(control, context());
+        if (!fieldBaselines.has(key)) fieldBaselines.set(key, initial);
+        if (restoreDrafts && dirtyFields.has(key) && fieldDrafts.has(key)) control.value = fieldDrafts.get(key);
+        eventRelationValues.set(id, control.value);
+        control.dataset.graphTracked = controlSignature(control);
+        control.addEventListener('change', () => eventRelationValues.set(id, control.value));
+        const row = field(find('event', id)?.title || id, control); row.classList.add('g-event-relation-row'); row.dataset.eventId = id;
+        eventRelationControls.set(id, control); relations.append(row);
+      }
+      relationField.hidden = ids.length > 1; relations.hidden = ids.length <= 1;
+      if (ids.length === 1) relation.value = eventRelationValues.get(ids[0]) || 'associated_with';
+      previousEvents = ids;
+    }
+    eventSelect.addEventListener('change', syncEventRelations);
+    eventSelect.addEventListener('graph:sync-options', syncEventRelations);
+    relation.addEventListener('change', () => {
+      if (previousEvents.length === 1) {
+        const id = previousEvents[0]; eventRelationValues.set(id, relation.value);
+        const control = eventRelationControls.get(id); if (control) { control.value = relation.value; control.dataset.graphTracked = controlSignature(control); }
+      }
+    });
+    syncEventRelations(false);
+    transitionForm.append(field('关联事件', eventPicker, multipleHint), relationField, relations, field('变化说明 / 因果判断依据', textarea('g-transition-note', transition?.note || '', 3)), reviewField('g-transition', transition?.review_status));
     trackForm(transitionForm, 'g-transition');
     saveActions(transitionForm, 'emotion_transition', () => changedGraph(() => {
       const subjectID = value('g-transition-subject'), from = value('g-transition-from'), to = value('g-transition-to'), events = values('g-transition-events');
       requireValue(subjectID && from && to && from !== to, '请选择同一主体的两个不同情感状态'); requireValue(events.length, '请选择关联这一情感变化的事件');
       const id = transition?.id || crypto.randomUUID();
       upsert('emotion_transition', { id, subject_id: subjectID, from_state_id: from, to_state_id: to, note: value('g-transition-note').trim(), review_status: value('g-transition-review') });
-      replaceLinks('emotion_transition', id, 'event', events, value('g-transition-relation'));
+      const previous = linksTo('emotion_transition', id, 'event');
+      const desired = events.map(eventID => ({ eventID, type: events.length === 1 ? relation.value : eventRelationControls.get(eventID)?.value || eventRelationValues.get(eventID) || 'associated_with' }));
+      if (!sameMembers(previous.map(link => link.from_id), events) || desired.some(entry => previous.find(link => link.from_id === entry.eventID)?.type !== entry.type)) {
+        graph().links = graph().links.filter(link => !(link.to_type === 'emotion_transition' && link.to_id === id && link.from_type === 'event'));
+        for (const entry of desired) graph().links.push({ id: previous.find(link => link.from_id === entry.eventID)?.id || crypto.randomUUID(), from_type: 'event', from_id: entry.eventID, to_type: 'emotion_transition', to_id: id, type: entry.type });
+      }
     }, '情感变化已保存'));
     partitionForm(transitionForm, 'emotion_transition', ['g-transition-subject', 'g-transition-from', 'g-transition-to', 'g-transition-relation', 'g-transition-review']);
-    transitionLayout.append(transitionForm); panel.append(transitionLayout, emotionTimeline()); return panel;
+    transitionLayout.prepend(transitionForm); panel.append(transitionLayout, emotionTimeline()); return panel;
   }
 
   function emotionTimeline() {
@@ -475,8 +554,9 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
     const toolbar = node('div', 'g-graph-toolbar'); toolbar.append(node('h3', '', '四层关联有向图'));
     const ns = 'http://www.w3.org/2000/svg';
     const svgNode = (tag, attrs = {}, text = '') => { const element = document.createElementNS(ns, tag); for (const [key, val] of Object.entries(attrs)) element.setAttribute(key, String(val)); if (text) element.textContent = text; return element; };
-    const total = data.reduce((sum, [, entries]) => sum + entries.length, 0), cap = total <= 200 ? Infinity : 50;
-    const displayed = data.map(([title, entries]) => [title, entries.slice(0, cap)]), shown = displayed.reduce((sum, [, entries]) => sum + entries.length, 0);
+    const viewLinks = graphViewLinks(graph());
+    const projection = projectGraphView(data, viewLinks, graphFocus, { page: graphPage });
+    const displayed = projection.data; graphPage = projection.page;
     const height = Math.max(260, 80 + Math.max(...displayed.map(([, entries]) => entries.length)) * 88);
     const svg = svgNode('svg', { id: 'g-directed-svg', xmlns: ns, viewBox: `0 0 1450 ${height}`, width: 1450, height, role: 'img', 'aria-label': '证据、事实、复合事件和情感脉络的有向关联图' });
     svg.append(svgNode('rect', { width: 1450, height, fill: '#fbfcf8' }));
@@ -489,11 +569,6 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
       entries.forEach(({ type, entry }, row) => positions.set(JSON.stringify([type, entry.id]), { x, y: 52 + row * 88, type, entry }));
     });
     const edgeGroup = svgNode('g', { 'data-graph-layer': 'edges' }), nodeGroup = svgNode('g', { 'data-graph-layer': 'nodes' });
-    const viewLinks = [...graph().links];
-    for (const transition of graph().emotion_transitions) {
-      viewLinks.push({ id: `before-${transition.id}`, from_type: 'emotion_state', from_id: transition.from_state_id, to_type: 'emotion_transition', to_id: transition.id, type: 'before_state' });
-      viewLinks.push({ id: `after-${transition.id}`, from_type: 'emotion_transition', from_id: transition.id, to_type: 'emotion_state', to_id: transition.to_state_id, type: 'after_state' });
-    }
     const labelNames = { ...RELATION_NAME, before_state: '变化前', after_state: '变化后' };
     const relatedNodes = new Set(), relatedEdges = new Set();
     const forward = new Map(), backward = new Map();
@@ -512,13 +587,13 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
         }
       }
     }
-    for (const link of viewLinks) {
+    for (const link of projection.links) {
       const from = positions.get(JSON.stringify([link.from_type, link.from_id])), to = positions.get(JSON.stringify([link.to_type, link.to_id]));
       if (!from || !to) continue;
       const x1 = from.x + width, y1 = from.y + 34, sameColumn = from.x === to.x, x2 = sameColumn ? to.x + width : to.x, y2 = to.y + 34;
       const bend = sameColumn ? Math.max(x1, x2) + 78 : (x1 + x2) / 2;
       const focused = relatedEdges.has(link.id);
-      const path = svgNode('path', { d: `M ${x1} ${y1} C ${bend} ${y1}, ${bend} ${y2}, ${x2} ${y2}`, fill: 'none', stroke: focused ? '#285b39' : '#98aa8f', 'stroke-width': focused ? 2.5 : 1.3, 'marker-end': 'url(#g-arrow)', 'data-edge-id': link.id });
+      const path = svgNode('path', { d: `M ${x1} ${y1} C ${bend} ${y1}, ${bend} ${y2}, ${x2} ${y2}`, fill: 'none', stroke: focused ? '#285b39' : '#71836b', 'stroke-width': focused ? 2.5 : 1.6, 'marker-end': 'url(#g-arrow)', 'data-edge-id': link.id });
       if (link.type === 'associated_with' || sameColumn) path.setAttribute('stroke-dasharray', '5 4');
       path.append(svgNode('title', {}, `${labelFor(link.from_type, link.from_id)} — ${labelNames[link.type]} → ${labelFor(link.to_type, link.to_id)}`)); edgeGroup.append(path);
       const labelX = sameColumn ? bend - 8 : (x1 + x2) / 2;
@@ -537,17 +612,22 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
       const meta = type === 'evidence' ? `${numberText(entry.global_start_time)} → ${numberText(entry.global_end_time)}` : REVIEW_NAME[entry.review_status] || TYPE_NAME[type];
       group.append(svgNode('text', { x: x + 10, y: y + 57, fill: '#61705c', 'font-family': 'sans-serif', 'font-size': 10 }, meta));
       group.append(svgNode('title', {}, labelFor(type, entry.id)));
-      const focus = () => { graphFocus = { type, id: entry.id }; render(); };
+      const focus = () => { graphFocus = { type, id: entry.id }; graphPage = 0; render(); };
       group.addEventListener('click', focus); group.addEventListener('keydown', event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); focus(); } });
       nodeGroup.append(group);
     }
     svg.append(edgeGroup, nodeGroup);
-    const exportButton = button('导出 SVG 图谱', () => {
-      const copy = svg.cloneNode(true); copy.removeAttribute('role'); copy.removeAttribute('style'); copy.setAttribute('width', '1450'); copy.setAttribute('height', String(height));
+    const exportButton = button('导出当前视图 SVG', () => {
+      const copy = svg.cloneNode(true); copy.removeAttribute('role'); copy.removeAttribute('style'); copy.setAttribute('width', '1450'); copy.setAttribute('height', String(height)); copy.setAttribute('data-export-scope', 'current-view');
       const serialized = '<?xml version="1.0" encoding="UTF-8"?>\n' + new XMLSerializer().serializeToString(copy);
       const url = URL.createObjectURL(new Blob([serialized], { type: 'image/svg+xml;charset=utf-8' })), link = node('a');
       link.href = url; link.download = 'four-layer-graph.svg'; document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
     }); exportButton.id = 'g-export-svg';
+    const fullExportButton = button('导出完整图谱 SVG', () => {
+      const serialized = serializeFullGraphSVG(data, viewLinks, { labelFor, reviewNames: REVIEW_NAME, relationNames: RELATION_NAME });
+      const url = URL.createObjectURL(new Blob([serialized], { type: 'image/svg+xml;charset=utf-8' })), link = node('a');
+      link.href = url; link.download = 'four-layer-full-graph.svg'; document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }); fullExportButton.id = 'g-export-full-svg';
     const viewport = node('div', 'g-svg-viewport');
     const sizeControls = node('div', 'g-graph-size-controls');
     const fitButton = button('适应宽度', () => { graphFit = true; syncSize(); }); fitButton.id = 'g-graph-fit';
@@ -556,8 +636,13 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
       viewport.classList.toggle('fit', graphFit); viewport.dataset.sizeMode = graphFit ? 'fit' : 'original';
       fitButton.setAttribute('aria-pressed', String(graphFit)); originalButton.setAttribute('aria-pressed', String(!graphFit));
     }
-    sizeControls.append(fitButton, originalButton, exportButton); toolbar.append(sizeControls); section.append(toolbar);
-    section.append(node('p', 'g-hint', shown < total ? `当前图显示 ${shown} / ${total} 个节点，每层最多 50 个；未显示的节点与关系仍完整保存在结果中，可从各阶段列表编辑。` : '根据标注关系自动生成全部节点与指向。虚线表示关联或状态衔接，不自动推断因果。'));
+    sizeControls.append(fitButton, originalButton, exportButton, fullExportButton); toolbar.append(sizeControls); section.append(toolbar);
+    const summary = node('p', 'g-hint', `${projection.mode === 'focus' ? '聚焦当前节点及其上下游' : '全部节点'}：本页 ${projection.shown} / 范围 ${projection.scopeTotal} / 项目 ${projection.total} 个节点。虚线表示关联或状态衔接，不自动推断因果。`); summary.id = 'g-graph-view-summary'; section.append(summary);
+    const paging = node('div', 'g-graph-page-controls'); paging.id = 'g-graph-page-controls';
+    const previousPage = button('上一页', () => { graphPage--; render(); }); previousPage.id = 'g-graph-prev'; previousPage.disabled = !projection.page;
+    const nextPage = button('下一页', () => { graphPage++; render(); }); nextPage.id = 'g-graph-next'; nextPage.disabled = projection.page >= projection.pageCount - 1;
+    const pageStatus = node('span', '', `${projection.page + 1} / ${projection.pageCount}`); pageStatus.id = 'g-graph-page-status';
+    paging.append(previousPage, pageStatus, nextPage); section.append(paging);
     viewport.append(svg); syncSize(); section.append(viewport); return section;
   }
 
@@ -576,7 +661,7 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
       const scroll = node('div', 'g-graph-scroll');
       for (const { type, entry } of items) {
         const focused = graphFocus?.type === type && graphFocus?.id === entry.id;
-        const item = button('', () => { graphFocus = { type, id: entry.id }; render(); }, 'g-graph-node' + (focused ? ' active' : neighbors.has(JSON.stringify([type, entry.id])) ? ' related' : ''));
+        const item = button('', () => { graphFocus = { type, id: entry.id }; graphPage = 0; render(); }, 'g-graph-node' + (focused ? ' active' : neighbors.has(JSON.stringify([type, entry.id])) ? ' related' : ''));
         item.dataset.nodeType = type; item.dataset.nodeId = entry.id;
         item.append(node('strong', '', short(labelFor(type, entry.id), 95)), node('small', '', type === 'evidence' ? `共同时间 ${numberText(entry.global_start_time)} → ${numberText(entry.global_end_time)}` : REVIEW_NAME[entry.review_status] || TYPE_NAME[type]));
         scroll.append(item);
@@ -586,12 +671,12 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
     panel.append(directedGraph(data));
     const nodeBrowser = node('details', 'g-graph-browser'); nodeBrowser.append(node('summary', '', '展开节点列表'), columns); panel.append(nodeBrowser);
     const relation = node('section', 'g-card'); relation.append(node('h3', '', graphFocus ? `${TYPE_NAME[graphFocus.type]}的上下游关系` : '全部关联关系'));
-    if (graphFocus) relation.append(node('p', 'g-focus-label', labelFor(graphFocus.type, graphFocus.id)), button(graphFocus.type === 'evidence' ? '回放此证据' : '编辑此节点', () => openNode(graphFocus.type, graphFocus.id), 'g-button'), button('显示全部关系', () => { graphFocus = null; render(); }, 'g-link'));
+    if (graphFocus) relation.append(node('p', 'g-focus-label', labelFor(graphFocus.type, graphFocus.id)), button(graphFocus.type === 'evidence' ? '回放此证据' : '编辑此节点', () => openNode(graphFocus.type, graphFocus.id), 'g-button'), button('显示全部关系', () => { graphFocus = null; graphPage = 0; render(); }, 'g-link'));
     const relevant = graphFocus ? graph().links.filter(link => (link.from_type === graphFocus.type && link.from_id === graphFocus.id) || (link.to_type === graphFocus.type && link.to_id === graphFocus.id)) : graph().links;
     const relationList = node('div', 'g-relation-list');
     for (const link of relevant) {
       const row = node('div', 'g-relation-row');
-      row.append(button(short(labelFor(link.from_type, link.from_id), 85), () => { graphFocus = { type: link.from_type, id: link.from_id }; render(); }, 'g-link'), node('span', 'g-relation-type', `— ${RELATION_NAME[link.type] || link.type} →`), button(short(labelFor(link.to_type, link.to_id), 85), () => { graphFocus = { type: link.to_type, id: link.to_id }; render(); }, 'g-link'));
+      row.append(button(short(labelFor(link.from_type, link.from_id), 85), () => { graphFocus = { type: link.from_type, id: link.from_id }; graphPage = 0; render(); }, 'g-link'), node('span', 'g-relation-type', `— ${RELATION_NAME[link.type] || link.type} →`), button(short(labelFor(link.to_type, link.to_id), 85), () => { graphFocus = { type: link.to_type, id: link.to_id }; graphPage = 0; render(); }, 'g-link'));
       relationList.append(row);
     }
     if (!relevant.length) relationList.append(node('p', 'g-empty', '暂无这组关联。请在事实、事件或情感表单中选择依据。'));
@@ -618,12 +703,12 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
     const workspace = ws(); root.hidden = !workspace;
     if (!workspace) { fieldDrafts.clear(); fieldBaselines.clear(); dirtyFields.clear(); renderedContext = null; updateUnsavedNote(); return; }
     if (renderedContext && renderedContext.workspace !== workspace.id) {
-      activeStage = 'evidence'; graphFocus = null; factSeed = null;
+      activeStage = 'evidence'; graphFocus = null; graphPage = 0; factSeed = null;
       for (const type of Object.keys(selected)) selected[type] = '';
       fieldDrafts.clear(); fieldBaselines.clear(); dirtyFields.clear(); renderedContext = null;
     }
     if (!workspace.graph) workspace.graph = blankGraph();
-    if (graphFocus && !find(graphFocus.type, graphFocus.id)) graphFocus = null;
+    if (graphFocus && !find(graphFocus.type, graphFocus.id)) { graphFocus = null; graphPage = 0; }
     root.dataset.stage = activeStage;
     const counts = { evidence: evidence().length, facts: graph().facts.length, events: graph().events.length, emotions: graph().emotion_states.length + graph().emotion_transitions.length };
     status.textContent = graph().status === 'complete' ? '四层已完成' : '四层待完成'; status.classList.toggle('complete', graph().status === 'complete');
@@ -648,7 +733,10 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
   function openFactFromEvidence(id) {
     const entry = find('evidence', id); if (!entry) return report('请先选择有效证据时间窗', true);
     const segment = ws().records[entry.item_id]?.segments.find(segment => segment.id === entry.segment_id);
-    captureFields(); clearFormContext('fact', ''); renderedContext = null;
+    captureFields();
+    const pendingFact = [...dirtyFields].some(key => { const [workspace, type, nodeID] = JSON.parse(key); return workspace === ws().id && type === 'fact' && !nodeID; });
+    if (pendingFact && !window.confirm('当前新增事实还有未保存内容。放弃这份草稿，并从所选证据重新整理事实？')) return false;
+    clearFormContext('fact', ''); renderedContext = null;
     selected.fact = ''; factSeed = { text: segment?.annotations?.local_fact || segment?.annotations?.observation || '', evidence_ids: [id], subject_ids: graph().entities.some(entity => entity.id === segment?.annotations?.subject_id) ? [segment.annotations.subject_id] : [] };
     stage('facts'); report('已带入当前证据和文本。请核对主体与事实表述后保存；没有自动确认。');
   }
