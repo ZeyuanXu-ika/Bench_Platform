@@ -1,0 +1,249 @@
+{
+  "format": "trace-annotations",
+  "schema_version": "2.0",
+  "batch_id": "graph_demo",
+  "assignment_id": "demo_A",
+  "annotator_id": "demo",
+  "revision": 0,
+  "exported_at": "2026-10-27T05:38:17.931Z",
+  "items": [
+    {
+      "id": "demo_video",
+      "title": "四层结构演示 · 合成视频",
+      "media_path": "media/demo.mp4",
+      "media_type": "video",
+      "source_id": "demo_scene",
+      "timeline_id": "demo_scene",
+      "time_offset_s": 0,
+      "clip_start_s": 0,
+      "duration_s": 12,
+      "video_fps": 25,
+      "text": "本示例只演示图谱结构。素材为合成测试信号，没有真实人物；以下情感状态为占位示例，不能作为真实情感数据。",
+      "status": "draft",
+      "segments": [
+        {
+          "id": "v1",
+          "start_time": 1,
+          "end_time": 3,
+          "label": "visual_observation",
+          "annotations": {
+            "subject_id": "demo_subject",
+            "observation": "第一段合成画面；结构演示",
+            "local_fact": "",
+            "evidence_role": "both",
+            "uncertainty": ""
+          }
+        },
+        {
+          "id": "v2",
+          "start_time": 6,
+          "end_time": 8,
+          "label": "visual_observation",
+          "annotations": {
+            "subject_id": "demo_subject",
+            "observation": "第二段合成画面；结构演示",
+            "local_fact": "",
+            "evidence_role": "both",
+            "uncertainty": ""
+          }
+        }
+      ],
+      "local_fact_notes": "",
+      "task_notes": "",
+      "media": null
+    },
+    {
+      "id": "demo_audio",
+      "title": "四层结构演示 · 合成音频",
+      "media_path": "media/demo.wav",
+      "media_type": "audio",
+      "source_id": "demo_scene",
+      "timeline_id": "demo_scene",
+      "time_offset_s": 0,
+      "clip_start_s": 0,
+      "duration_s": 12.032,
+      "video_fps": null,
+      "text": "合成测试音，用于演示同一事实关联多模态证据。人物与情感信息均为结构占位。",
+      "status": "draft",
+      "segments": [
+        {
+          "id": "a1",
+          "start_time": 1,
+          "end_time": 3,
+          "label": "acoustic_observation",
+          "annotations": {
+            "subject_id": "demo_subject",
+            "observation": "合成测试音；结构演示",
+            "local_fact": "",
+            "evidence_role": "both",
+            "uncertainty": ""
+          }
+        }
+      ],
+      "local_fact_notes": "",
+      "task_notes": "",
+      "media": null
+    }
+  ],
+  "graph": {
+    "status": "draft",
+    "entities": [
+      {
+        "id": "demo_subject",
+        "name": "虚构演示主体（非真实人物）",
+        "aliases": []
+      }
+    ],
+    "mentions": [
+      {
+        "id": "mention_0",
+        "entity_id": "demo_subject",
+        "evidence_id": "[\"demo_video\",\"v1\"]",
+        "description": "仅用于演示共指映射，不代表实际人物身份"
+      },
+      {
+        "id": "mention_1",
+        "entity_id": "demo_subject",
+        "evidence_id": "[\"demo_video\",\"v2\"]",
+        "description": "仅用于演示共指映射，不代表实际人物身份"
+      },
+      {
+        "id": "mention_2",
+        "entity_id": "demo_subject",
+        "evidence_id": "[\"demo_audio\",\"a1\"]",
+        "description": "仅用于演示共指映射，不代表实际人物身份"
+      }
+    ],
+    "facts": [
+      {
+        "id": "fact_1",
+        "text": "演示事实 A：第一组测试信号出现。",
+        "subject_ids": [
+          "demo_subject"
+        ],
+        "kind": "observation",
+        "speaker_id": "",
+        "review_status": "needs_review"
+      },
+      {
+        "id": "fact_2",
+        "text": "演示事实 B：后续测试画面发生变化。",
+        "subject_ids": [
+          "demo_subject"
+        ],
+        "kind": "observation",
+        "speaker_id": "",
+        "review_status": "needs_review"
+      }
+    ],
+    "events": [
+      {
+        "id": "event_1",
+        "title": "结构演示：测试信号出现并变化",
+        "subject_ids": [
+          "demo_subject"
+        ],
+        "timeline_id": "demo_scene",
+        "review_status": "needs_review"
+      }
+    ],
+    "emotion_states": [
+      {
+        "id": "state_1",
+        "subject_id": "demo_subject",
+        "label": "占位状态 A",
+        "timeline_id": "demo_scene",
+        "start_time": 1,
+        "end_time": 3,
+        "intensity": null,
+        "review_status": "needs_review"
+      },
+      {
+        "id": "state_2",
+        "subject_id": "demo_subject",
+        "label": "占位状态 B",
+        "timeline_id": "demo_scene",
+        "start_time": 6,
+        "end_time": 8,
+        "intensity": null,
+        "review_status": "needs_review"
+      }
+    ],
+    "emotion_transitions": [
+      {
+        "id": "transition_1",
+        "subject_id": "demo_subject",
+        "from_state_id": "state_1",
+        "to_state_id": "state_2",
+        "note": "仅展示状态前后关系，不表示从合成素材推断出了真实情绪。",
+        "review_status": "needs_review"
+      }
+    ],
+    "links": [
+      {
+        "id": "link_1",
+        "from_type": "evidence",
+        "from_id": "[\"demo_video\",\"v1\"]",
+        "to_type": "fact",
+        "to_id": "fact_1",
+        "type": "supports"
+      },
+      {
+        "id": "link_2",
+        "from_type": "evidence",
+        "from_id": "[\"demo_audio\",\"a1\"]",
+        "to_type": "fact",
+        "to_id": "fact_1",
+        "type": "supports"
+      },
+      {
+        "id": "link_3",
+        "from_type": "evidence",
+        "from_id": "[\"demo_video\",\"v2\"]",
+        "to_type": "fact",
+        "to_id": "fact_2",
+        "type": "supports"
+      },
+      {
+        "id": "link_4",
+        "from_type": "fact",
+        "from_id": "fact_1",
+        "to_type": "event",
+        "to_id": "event_1",
+        "type": "constitutes"
+      },
+      {
+        "id": "link_5",
+        "from_type": "fact",
+        "from_id": "fact_2",
+        "to_type": "event",
+        "to_id": "event_1",
+        "type": "constitutes"
+      },
+      {
+        "id": "link_6",
+        "from_type": "fact",
+        "from_id": "fact_1",
+        "to_type": "emotion_state",
+        "to_id": "state_1",
+        "type": "grounds"
+      },
+      {
+        "id": "link_7",
+        "from_type": "fact",
+        "from_id": "fact_2",
+        "to_type": "emotion_state",
+        "to_id": "state_2",
+        "type": "grounds"
+      },
+      {
+        "id": "link_8",
+        "from_type": "event",
+        "from_id": "event_1",
+        "to_type": "emotion_transition",
+        "to_id": "transition_1",
+        "type": "associated_with"
+      }
+    ]
+  }
+}

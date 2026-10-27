@@ -1,5 +1,5 @@
-const CACHE = 'bench-platform-code-v1';
-const FILES = ['./', './index.html', './styles.css', './app.mjs', './core.mjs', './storage.mjs', './favicon.svg', './README.md'];
+const CACHE = 'bench-platform-code-v2';
+const FILES = ['./', './index.html', './styles.css', './graph-ui.css', './app.mjs', './core.mjs', './graph.mjs', './graph-ui.mjs', './storage.mjs', './favicon.svg', './README.md'];
 const ALLOWED = new Set(FILES.map(x => new URL(x, self.registration.scope).pathname));
 self.addEventListener('install', event => {
   event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(FILES)).then(() => self.skipWaiting()));
@@ -11,5 +11,5 @@ self.addEventListener('fetch', event => {
   event.respondWith(fetch(event.request).then(async response => {
     if (response.ok) { const cache = await caches.open(CACHE); await cache.put(event.request, response.clone()); }
     return response;
-  }).catch(async () => (await caches.match(event.request)) || new Response('请联网打开标注页面一次，以缓存网页程序。', { status: 503, headers: { 'Content-Type': 'text/plain;charset=utf-8' } })));
+  }).catch(async () => (await (await caches.open(CACHE)).match(event.request)) || new Response('请联网打开标注页面一次，以缓存网页程序。', { status: 503, headers: { 'Content-Type': 'text/plain;charset=utf-8' } })));
 });

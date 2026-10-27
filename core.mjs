@@ -1,4 +1,6 @@
-export const VERSION = '1.0';
+import { blankGraph, normalizeGraph, migrateLegacyGraph } from './graph.mjs';
+
+export const VERSION = '2.0';
 export const MAX_JSON_BYTES = 20 * 1024 * 1024;
 export const MAX_ITEMS = 5000;
 export const MAX_SEGMENTS = 1000;
@@ -53,6 +55,12 @@ function cleanItem(raw, index) {
   return {
     id, title: text(raw.title, '素材标题', 500, id), media_path: path, media_type: type,
     source_id: identifier(raw.source_id, '原片 ID', id),
+    timeline_id: identifier(raw.timeline_id, '共同时间轴 ID', raw.source_id || id),
+    time_offset_s: (() => {
+      const offset = raw.time_offset_s ?? raw.clip_start_s ?? 0;
+      if (typeof offset !== 'number' || !Number.isFinite(offset) || Math.abs(offset) > 1e9) throw new Error('共同时间轴偏移必须是有效秒数');
+      return offset;
+    })(),
     clip_start_s: finite(raw.clip_start_s, '原片起始秒'),
     duration_s: finite(raw.duration_s ?? raw.media?.duration_s, '素材时长', null),
     video_fps: fps, text: text(raw.text, '任务说明'),
@@ -62,7 +70,7 @@ export function parseManifest(input) {
   const raw = typeof input === 'string' ? parseJSON(input) : input;
   const list = Array.isArray(raw) ? raw : raw?.items;
   if (!Array.isArray(list) || !list.length || list.length > MAX_ITEMS) throw new Error('任务清单应包含 1–5000 条 items');
-  if (!Array.isArray(raw) && raw.schema_version && raw.schema_version !== VERSION) throw new Error('任务清单版本不受支持');
+  if (!Array.isArray(raw) && raw.schema_version && !['1.0', VERSION].includes(raw.schema_version)) throw new Error('任务清单版本不受支持');
   const items = list.map(cleanItem);
   if (new Set(items.map(x => x.id)).size !== items.length) throw new Error('任务清单存在重复素材 ID');
   return {
@@ -76,7 +84,7 @@ export function blankRecord(item) {
 }
 export function newWorkspace(manifest) {
   return { id: crypto.randomUUID(), manifest, records: Object.fromEntries(manifest.items.map(x => [x.id, blankRecord(x)])),
-    index: 0, revision: 0, exported_revision: -1, updated_at: new Date().toISOString() };
+    graph: blankGraph(), index: 0, revision: 0, exported_revision: -1, updated_at: new Date().toISOString() };
 }
 export function cleanSegment(raw, item) {
   if (!raw || typeof raw !== 'object') throw new Error('片段不是有效对象');
@@ -134,11 +142,16 @@ export function cleanRecord(raw, item) {
 }
 export function parseResults(input) {
   const raw = typeof input === 'string' ? parseJSON(input) : input;
-  if (raw?.format !== 'trace-annotations' || raw.schema_version !== VERSION) throw new Error('请选择本平台导出的 1.0 版本结果文件');
+  if (raw?.format !== 'trace-annotations' || !['1.0', VERSION].includes(raw.schema_version)) throw new Error('请选择本平台导出的 1.0 或 2.0 版本结果文件');
   const manifest = parseManifest(raw);
   const ws = newWorkspace(manifest);
   for (let i = 0; i < manifest.items.length; i++) {
     const item = manifest.items[i]; ws.records[item.id] = cleanRecord(raw.items[i], item);
+  }
+  if (raw.schema_version === '1.0') ws.graph = migrateLegacyGraph(ws);
+  else {
+    if (!raw.graph || typeof raw.graph !== 'object') throw new Error('2.0 结果文件缺少四层图谱数据');
+    ws.graph = normalizeGraph(raw.graph, ws);
   }
   ws.revision = Number.isSafeInteger(raw.revision) && raw.revision >= 0 ? raw.revision : 0;
   ws.exported_revision = ws.revision;
@@ -149,7 +162,8 @@ export function makeExport(ws) {
   if (!m.batch_id || !m.assignment_id || !m.annotator_id) throw new Error('请先填写批次 ID、任务 ID 和标注员 ID');
   return { format: 'trace-annotations', schema_version: VERSION, batch_id: m.batch_id,
     assignment_id: m.assignment_id, annotator_id: m.annotator_id, revision: ws.revision, exported_at: new Date().toISOString(),
-    items: m.items.map(item => ({ ...item, ...cleanRecord(ws.records[item.id], item) })) };
+    items: m.items.map(item => ({ ...item, ...cleanRecord(ws.records[item.id], item) })),
+    graph: normalizeGraph(ws.graph || migrateLegacyGraph(ws), ws) };
 }
 export function matchFile(item, files) {
   const target = item.media_path.toLocaleLowerCase();

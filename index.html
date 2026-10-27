@@ -3,13 +3,14 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="音视频证据标注工作台：本地文件导入、本地草稿与 JSON 结果导出。">
+  <meta name="description" content="多模态证据、客观事实、复合事件与主体情感脉络的四层标注工作台，支持本地 JSON 和 SVG 图谱导出。">
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; media-src blob:; img-src 'self' data:; connect-src 'self'; worker-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'">
   <meta name="referrer" content="no-referrer">
   <meta name="color-scheme" content="light">
-  <title>Bench Platform · 本地标注工作台</title>
+  <title>Bench Platform · 四层标注工作台</title>
   <link rel="icon" href="./favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="./styles.css">
+  <link rel="stylesheet" href="./graph-ui.css">
   <script type="module" src="./app.mjs"></script>
 </head>
 <body>
@@ -38,6 +39,7 @@
         <span id="draft-status" hidden aria-hidden="true"></span>
         <div class="task-heading"><h2 id="item-title"></h2></div>
         <p id="task-description" class="task-description" hidden></p>
+        <div id="graph-workbench"></div>
         <div class="editor-grid">
           <section class="media-column" aria-label="素材与证据区间">
             <div class="media-stage"><div id="media-empty" class="media-empty"><span class="empty-icon" aria-hidden="true">↗</span><h3>选择这条任务对应的本地文件</h3><p id="missing-path"></p><button id="attach-current" class="stage-button">选择素材文件</button></div><video id="video" controls preload="metadata" playsinline hidden></video><div id="audio-stage" hidden><div class="audio-symbol" aria-hidden="true">∿</div><span>声音，是另一种证据。</span><audio id="audio" controls preload="metadata"></audio></div></div>
@@ -52,7 +54,7 @@
             <div class="marker-bar"><label>起点 / 秒<input id="segment-start" type="number" min="0" step="0.001" placeholder="0.000"></label><label>终点 / 秒<input id="segment-end" type="number" min="0" step="0.001" placeholder="0.000"></label><button id="add-segment" class="primary small">新建时间窗</button><button id="delete-segment" class="danger-button" disabled>删除选中时间窗</button></div>
             <p id="time-edit-hint" class="time-edit-hint" role="status">拖动时间轴，或填写起止时间后新建。修改选中时间窗的数字会自动保存。</p>
             <section class="annotation-panel" aria-label="选中时间窗的类别与标注内容">
-              <div class="detail-top"><h3>类别与标注内容</h3><p>从右侧列表选择一个时间窗进行编辑。</p></div>
+              <div class="detail-top"><h3>证据观察与事实草稿</h3><p>选择证据窗，填写观察，再整理为独立事实。</p><button id="build-fact" class="secondary small">整理为事实 →</button></div>
               <div id="detail-empty" class="detail-empty">先创建或选择时间窗，再填写归属类别和局部事实。</div>
               <div id="segment-detail" hidden>
                 <div class="category-column"><div class="detail-summary"><span id="detail-label"></span><span id="detail-time"></span></div><label>归属类别<select id="segment-category"></select></label><label>主体 ID<input id="subject-id" maxlength="500" placeholder="未知请填 unknown"></label><label>证据用途<select id="evidence-role"><option value="">请选择用途</option><option value="event_support">事件支持</option><option value="emotion_observation">情绪观察</option><option value="both">两者兼有</option><option value="uncertain">暂不确定</option></select></label></div>

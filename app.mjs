@@ -1,6 +1,8 @@
 import { LABELS, MAX_JSON_BYTES, MAX_ITEMS, MAX_SEGMENTS, MEDIA_RE, blankRecord, cleanSegment, completionErrors,
   displayTime, editInterval, identifier, makeExport, manifestFromFiles, matchFile, newWorkspace, parseManifest, parseResults, planMediaImport, safeFilename } from './core.mjs';
 import { listWorkspaces, removeWorkspace, storeWorkspace } from './storage.mjs';
+import { evidenceKey, invalidateEvidence, removeEvidence, migrateLegacyGraph } from './graph.mjs';
+import { mountGraphWorkbench } from './graph-ui.mjs';
 
 const $ = id => document.getElementById(id);
 const SETTINGS_KEY = `bench-settings-v1:${new URL('.', location.href).pathname}`;
@@ -25,6 +27,7 @@ let saveQueue = Promise.resolve();
 let busy = false;
 let frameEdit = null;
 let frameSeek = 0;
+let graphWorkbench;
 const item = () => ws?.manifest.items[ws.index];
 const record = () => ws?.records[item()?.id];
 const segment = () => record()?.segments.find(s => s.id === selected);
@@ -54,18 +57,23 @@ function enqueueDraft() {
 }
 function changed(invalidate = true) {
   if (!ws) return;
-  if (invalidate) record().status = 'draft';
+  if (invalidate) {
+    record().status = 'draft';
+    const segments = segment() ? [segment()] : record().segments;
+    invalidateEvidence(ws, segments.map(seg => evidenceKey(item().id, seg.id)));
+  }
   ws.revision++; ws.updated_at = new Date().toISOString();
   status('修改尚未导出 · 正在记录草稿');
   clearTimeout(draftTimer); draftTimer = setTimeout(enqueueDraft, 350);
   renderProgress();
+  graphWorkbench?.render();
 }
 function renderProgress() {
   if (!ws) return;
   const completed = ws.manifest.items.filter(x => ws.records[x.id].status === 'complete').length;
   $('progress').max = ws.manifest.items.length; $('progress').value = completed;
   $('task-count').textContent = ws.manifest.items.length;
-  $('progress-label').textContent = `${completed} / ${ws.manifest.items.length} 已完成`;
+  $('progress-label').textContent = `${completed} / ${ws.manifest.items.length} 素材证据已标记`;
   $('progress-percent').textContent = `${Math.round(completed / ws.manifest.items.length * 100)}%`;
   renderTaskList();
 }
@@ -154,6 +162,7 @@ function renderDetail() {
   const seg = segment();
   $('segment-detail').hidden = !seg; $('detail-empty').hidden = Boolean(seg);
   $('delete-segment').disabled = !seg;
+  $('build-fact').disabled = !seg;
   if (!seg) return;
   $('detail-label').textContent = LABELS.find(x => x.id === seg.label).name;
   const category = $('segment-category');
@@ -281,6 +290,7 @@ function renderCurrent() {
   $('item-position').textContent = `${String(ws.index + 1).padStart(2, '0')} / ${String(ws.manifest.items.length).padStart(2, '0')}`;
   $('previous-item').disabled = ws.index === 0; $('next-item').disabled = ws.index === ws.manifest.items.length - 1;
   renderProgress(); renderLabels(); renderSegments(); renderDetail(); loadMedia();
+  graphWorkbench?.render();
 }
 async function switchItem(index) {
   if (!ws || index < 0 || index >= ws.manifest.items.length) return;
@@ -367,12 +377,13 @@ async function deleteTask() {
     if (ws !== workspace) return;
     if (ws.manifest.items.length === 1) {
       await removeWorkspace(ws);
-      releaseMedia(); ws = null; selected = null; attached = new Map();
+      releaseMedia(); ws = null; selected = null; attached = new Map(); graphWorkbench?.render();
       $('workspace').hidden = true; $('welcome').hidden = false; $('task-search').value = '';
     } else {
       const currentID = item().id, index = ws.manifest.items.findIndex(task => task.id === target.id);
       if (index < 0) return;
       releaseMedia();
+      removeEvidence(ws, ws.records[target.id].segments.map(seg => evidenceKey(target.id, seg.id)));
       ws.manifest.items.splice(index, 1); delete ws.records[target.id]; attached.delete(target.id);
       ws.index = currentID === target.id ? Math.min(index, ws.manifest.items.length - 1) : ws.manifest.items.findIndex(task => task.id === currentID);
       changed(false); renderCurrent(); await enqueueDraft();
@@ -437,6 +448,11 @@ for (const [mediaID, kind] of [['video', 'video'], ['audio', 'audio']]) {
     item().duration_s = media.duration;
     record().media = metadata;
     loaded = true; $('seek').max = media.duration; $('seek').disabled = false;
+    const chosen = segment();
+    if (chosen) {
+      media.currentTime = chosen.start_time;
+      $('seek').value = chosen.start_time; $('current-time').textContent = displayTime(chosen.start_time);
+    }
     $('media-duration').textContent = `${displayTime(media.duration)}${item().video_fps ? ` · ${item().video_fps} fps 参考` : ''}`;
     renderTimeline();
     if (metadataChanged) changed(false);
@@ -488,7 +504,8 @@ $('add-segment').addEventListener('click', run(addSegment));
 $('delete-segment').addEventListener('click', () => {
   if (!segment()) return;
   if (!window.confirm('删除选中的时间窗及其标注内容？')) return;
-  record().segments = record().segments.filter(s => s.id !== selected); selected = null; changed(); renderSegments(); renderDetail();
+  removeEvidence(ws, [evidenceKey(item().id, selected)]);
+  record().segments = record().segments.filter(s => s.id !== selected); record().status = 'draft'; selected = null; changed(false); renderSegments(); renderDetail();
   enqueueDraft();
 });
 $('play-toggle').addEventListener('click', run(togglePlay));
@@ -627,10 +644,13 @@ document.addEventListener('keydown', e => {
   else if (e.key === '.') { e.preventDefault(); step(1); }
   else { const label = LABELS.find(x => x.key === e.key); if (label) { e.preventDefault(); chooseLabel(label.id); } }
 });
-window.addEventListener('beforeunload', e => { if (ws && ws.revision !== ws.exported_revision && ws.revision > 0) { e.preventDefault(); e.returnValue = ''; } });
+window.addEventListener('beforeunload', e => {
+  if (graphWorkbench?.hasUnsavedChanges?.() || (ws && ws.revision !== ws.exported_revision && ws.revision > 0)) { e.preventDefault(); e.returnValue = ''; }
+});
 window.addEventListener('pagehide', () => { enqueueDraft(); });
 
 function validateDraft(saved) {
+  if (!saved.graph) saved = { ...saved, graph: migrateLegacyGraph(saved) };
   const identity = saved.manifest;
   const clean = parseResults(makeExport({ ...saved, manifest: { ...identity, batch_id: identity.batch_id || 'draft', assignment_id: identity.assignment_id || 'draft', annotator_id: identity.annotator_id || 'draft' } }));
   clean.id = identifier(saved.id, '草稿 ID');
@@ -648,9 +668,39 @@ async function boot() {
       // Revalidate IndexedDB records through the same whitelist as imported JSON.
       const clean = validateDraft(saved);
       ws = clean; renderWorkspace();
+      if (!saved.graph) await enqueueDraft();
       status('已恢复浏览器草稿 · 请重新选择素材'); notify('已恢复最近的草稿。请重新选择本地素材，或导入另一份任务清单');
     }
   } catch { notify('无法恢复浏览器草稿；可导入之前导出的本地 JSON 继续标注', true); }
 }
+graphWorkbench = mountGraphWorkbench($('graph-workbench'), {
+  getWorkspace: () => ws,
+  changed: async () => { if (ws) { changed(false); await enqueueDraft(); } },
+  navigateEvidence: async (itemID, segmentID) => {
+    if (!ws) return;
+    const index = ws.manifest.items.findIndex(task => task.id === itemID);
+    if (index < 0) return;
+    if (ws.index !== index) await switchItem(index);
+    selectSegment(segmentID);
+    requestAnimationFrame(() => document.querySelector('.media-stage').scrollIntoView({ block: 'center', behavior: 'smooth' }));
+  }
+});
+$('local-fact').closest('label').firstChild.textContent = '待整理事实（可选）';
+$('observation').closest('label').firstChild.textContent = '证据观察';
+$('segment-category').closest('label').firstChild.textContent = '证据类型';
+$('subject-id').closest('label').firstChild.textContent = '主体线索';
+$('subject-id').placeholder = '黄衣人 / 说话人 A；未知填 unknown';
+$('evidence-role').closest('label').firstChild.textContent = '后续用途提示';
+$('progress').setAttribute('aria-label', '素材证据标记进度');
+document.querySelector('.brand-sub').textContent = '多模态四层标注工作台';
+document.querySelector('.annotation-panel .content-column p').textContent = '这里的文字保存在证据窗内；点击“整理为事实”进入第二层，选择主体和依据后保存独立事实。';
+$('complete-item').textContent = '证据标记完成并继续';
+const graphDemoLink = el('a', '', '下载四层图谱示例');
+graphDemoLink.href = './samples/demo-graph.json'; graphDemoLink.download = 'demo-graph.json';
+document.querySelector('.welcome-foot').append(el('span', '', '·'), graphDemoLink);
+$('build-fact').addEventListener('click', () => {
+  if (!segment()) return notify('请先选择一个证据时间窗', true);
+  graphWorkbench.openFactFromEvidence(evidenceKey(item().id, selected));
+});
 boot();
 if ('serviceWorker' in navigator && window.isSecureContext) navigator.serviceWorker.register('./sw.js').catch(() => {});
