@@ -497,7 +497,7 @@ $('complete-item').addEventListener('click', run(completeItem));
 $('export-result').addEventListener('click', exportResultsHandler);
 $('download-result').addEventListener('click', () => { exportResults(true).catch(e => notify(e.message, true)); });
 function exportResultsHandler() { exportResults().catch(e => notify(e.message, true)); }
-$('drafts-button').addEventListener('click', run(showDrafts));
+for (const id of ['drafts-button', 'welcome-drafts']) $(id).addEventListener('click', run(showDrafts));
 $('delete-task').addEventListener('click', run(deleteTask));
 for (const id of ['segment-start', 'segment-end']) $(id).addEventListener('change', updateSelectedTimes);
 $('add-segment').addEventListener('click', run(addSegment));
@@ -660,19 +660,6 @@ function validateDraft(saved) {
   if (saved._storage_token) clean._storage_token = identifier(saved._storage_token, '草稿版本令牌');
   return clean;
 }
-async function boot() {
-  try {
-    const drafts = await listWorkspaces();
-    if (drafts.length) {
-      const saved = drafts[0];
-      // Revalidate IndexedDB records through the same whitelist as imported JSON.
-      const clean = validateDraft(saved);
-      ws = clean; renderWorkspace();
-      if (!saved.graph) await enqueueDraft();
-      status('已恢复浏览器草稿 · 请重新选择素材'); notify('已恢复最近的草稿。请重新选择本地素材，或导入另一份任务清单');
-    }
-  } catch { notify('无法恢复浏览器草稿；可导入之前导出的本地 JSON 继续标注', true); }
-}
 graphWorkbench = mountGraphWorkbench($('graph-workbench'), {
   getWorkspace: () => ws,
   changed: async () => { if (ws) { changed(false); await enqueueDraft(); } },
@@ -688,19 +675,16 @@ graphWorkbench = mountGraphWorkbench($('graph-workbench'), {
 $('local-fact').closest('label').firstChild.textContent = '待整理事实（可选）';
 $('observation').closest('label').firstChild.textContent = '证据观察';
 $('segment-category').closest('label').firstChild.textContent = '证据类型';
-$('subject-id').closest('label').firstChild.textContent = '主体线索';
-$('subject-id').placeholder = '黄衣人 / 说话人 A；未知填 unknown';
+$('subject-id').closest('label').firstChild.textContent = '主体';
+$('subject-id').placeholder = '在此标注主体，后续卡片沿用；未知填 unknown';
 $('evidence-role').closest('label').firstChild.textContent = '后续用途提示';
 $('progress').setAttribute('aria-label', '素材证据标记进度');
 document.querySelector('.brand-sub').textContent = '多模态四层标注工作台';
-document.querySelector('.annotation-panel .content-column p').textContent = '这里的文字保存在证据窗内；点击“整理为事实”进入第二层，选择主体和依据后保存独立事实。';
+document.querySelector('.annotation-panel .content-column p').textContent = '这里的文字保存在证据窗内；点击“整理为事实”后沿用证据主体，无需重复建立主体。核对描述与依据后保存独立事实。';
 $('complete-item').textContent = '证据标记完成并继续';
-const graphDemoLink = el('a', '', '下载四层图谱示例');
-graphDemoLink.href = './samples/demo-graph.json'; graphDemoLink.download = 'demo-graph.json';
-document.querySelector('.welcome-foot').append(el('span', '', '·'), graphDemoLink);
 $('build-fact').addEventListener('click', () => {
   if (!segment()) return notify('请先选择一个证据时间窗', true);
   graphWorkbench.openFactFromEvidence(evidenceKey(item().id, selected));
 });
-boot();
+// Start empty. Existing drafts stay in IndexedDB until explicitly restored.
 if ('serviceWorker' in navigator && window.isSecureContext) navigator.serviceWorker.register('./sw.js').catch(() => {});

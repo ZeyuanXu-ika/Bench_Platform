@@ -77,6 +77,21 @@ async function assertEditorLayout() {
   }
 }
 
+async function assertEmptyStartup(targetPage = page) {
+  await targetPage.waitForSelector('#welcome:not([hidden])');
+  assert.equal(await targetPage.locator('#workspace').isVisible(), false);
+  assert.equal(await targetPage.locator('.task-item').count(), 0);
+  assert.equal(await targetPage.locator('#video').getAttribute('src'), null);
+  assert.equal(await targetPage.locator('#audio').getAttribute('src'), null);
+  assert.equal(await targetPage.locator('#welcome a[href*="samples/"]').count(), 0);
+}
+async function restoreLatest(targetPage = page) {
+  await assertEmptyStartup(targetPage);
+  await targetPage.locator('#welcome-drafts').click();
+  await targetPage.waitForSelector('#draft-dialog[open]');
+  await targetPage.locator('.draft-row').first().click();
+  await targetPage.waitForSelector('#workspace:not([hidden])');
+}
 try {
   await page.goto(origin);
   await page.waitForSelector('#welcome:not([hidden])');
@@ -275,13 +290,13 @@ try {
   await page.waitForFunction(() => document.querySelector('.g-status').textContent === '四层已完成');
   const roundtrip = await downloadJSON('four-layer-roundtrip.json');
   assert.deepEqual(roundtrip.graph, complete.graph);
-  await waitSaved(); await page.reload(); await page.waitForSelector('#workspace:not([hidden])');
+  await waitSaved(); await page.reload(); await restoreLatest(); await page.waitForSelector('#workspace:not([hidden])');
   await stage('graph');
   const reloaded = await downloadJSON('four-layer-reloaded.json');
   assert.deepEqual(reloaded.graph, complete.graph);
   await page.evaluate(async () => { await navigator.serviceWorker.ready; });
   await page.waitForFunction(() => Boolean(navigator.serviceWorker.controller));
-  await context.setOffline(true); await page.reload(); await page.waitForSelector('#workspace:not([hidden])');
+  await context.setOffline(true); await page.reload(); await restoreLatest(); await page.waitForSelector('#workspace:not([hidden])');
   await stage('graph'); await page.waitForSelector('#g-directed-svg');
   assert.equal(await page.locator('.g-status').textContent(), '四层已完成');
   await context.setOffline(false);
@@ -362,14 +377,14 @@ try {
       transaction.oncomplete = resolve; transaction.onerror = () => reject(transaction.error);
     }); database.close();
   }, oldWorkspace);
-  await legacyPage.reload(); await legacyPage.waitForSelector('#workspace:not([hidden])');
+  await legacyPage.reload(); await restoreLatest(legacyPage); await legacyPage.waitForSelector('#workspace:not([hidden])');
   await legacyPage.waitForFunction(async id => {
     const database = await new Promise((resolve, reject) => { const request = indexedDB.open('bench-platform-local-v1:' + new URL('.', location.href).pathname, 1); request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error); });
     const saved = await new Promise((resolve, reject) => { const request = database.transaction('workspaces').objectStore('workspaces').get(id); request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error); }); database.close();
     return Boolean(saved?.graph);
   }, oldWorkspace.id);
   const firstLegacyReload = await downloadJSON('legacy-draft-first-reload.json', legacyPage);
-  await legacyPage.reload(); await legacyPage.waitForSelector('#workspace:not([hidden])');
+  await legacyPage.reload(); await restoreLatest(legacyPage); await legacyPage.waitForSelector('#workspace:not([hidden])');
   const secondLegacyReload = await downloadJSON('legacy-draft-second-reload.json', legacyPage);
   assert.deepEqual(secondLegacyReload.graph, firstLegacyReload.graph);
   assert.deepEqual(secondLegacyReload.items.map(item => item.segments.map(segment => ({ id: segment.id, text: segment.annotations.local_fact }))),

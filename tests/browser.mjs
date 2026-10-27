@@ -30,8 +30,29 @@ const errors = []; const traffic = []; const checks = [];
 page.on('pageerror', e => errors.push(e.message));
 context.on('request', req => traffic.push({ method: req.method(), url: req.url() }));
 const check = (name) => { checks.push(name); console.log('PASS:', name); };
+async function assertEmptyStartup(targetPage = page) {
+  await targetPage.waitForSelector('#welcome:not([hidden])');
+  assert.equal(await targetPage.locator('#workspace').isVisible(), false);
+  assert.equal(await targetPage.locator('.task-item').count(), 0);
+  assert.equal(await targetPage.locator('#video').getAttribute('src'), null);
+  assert.equal(await targetPage.locator('#audio').getAttribute('src'), null);
+  assert.equal(await targetPage.locator('#welcome a[href*="samples/"]').count(), 0);
+}
+async function restoreLatest(targetPage = page) {
+  await assertEmptyStartup(targetPage);
+  await targetPage.locator('#welcome-drafts').click();
+  await targetPage.waitForSelector('#draft-dialog[open]');
+  await targetPage.locator('.draft-row').first().click();
+  await targetPage.waitForSelector('#workspace:not([hidden])');
+}
 try {
   await page.goto(origin); await page.waitForSelector('#welcome:not([hidden])');
+  await assertEmptyStartup();
+  await page.locator('#welcome-drafts').click();
+  await page.waitForSelector('#draft-dialog[open]');
+  assert.equal(await page.locator('.draft-row').count(), 0);
+  await page.locator('#draft-dialog .close-dialog').click();
+  check('empty startup requires explicit import or draft restoration and contains no demo tasks or media');
   await page.screenshot({ path: path.join(artifacts, 'welcome-full.png'), fullPage: true });
   await page.locator('#manifest-input').setInputFiles(path.join(taskDir, 'tasks.json'));
   await page.waitForSelector('#workspace:not([hidden])');
@@ -77,7 +98,7 @@ try {
   assert.ok(!fs.readFileSync(exportPath, 'utf8').includes('base64'));
   check('actual JSON file download with complete independent audio/video records');
 
-  await page.reload(); await page.waitForFunction(() => document.getElementById('progress-label').textContent.startsWith('2 / 2'));
+  await page.reload(); await restoreLatest(); await page.waitForFunction(() => document.getElementById('progress-label').textContent.startsWith('2 / 2'));
   assert.equal(await page.locator('#media-empty').isVisible(), true);
   await page.locator('#folder-input').setInputFiles(taskDir);
   await page.waitForFunction(() => document.getElementById('audio').readyState >= 2);
@@ -121,20 +142,20 @@ try {
   await page.evaluate(async () => { await navigator.serviceWorker.ready; });
   await page.waitForFunction(() => Boolean(navigator.serviceWorker.controller));
   await page.waitForFunction(() => document.getElementById('draft-status').textContent.includes('草稿已存'));
-  await context.setOffline(true); await page.reload(); await page.waitForSelector('#workspace:not([hidden])');
+  await context.setOffline(true); await page.reload(); await restoreLatest(); await page.waitForSelector('#workspace:not([hidden])');
   await page.locator('#folder-input').setInputFiles(taskDir); await page.waitForFunction(() => document.getElementById('video').readyState >= 2);
   await page.locator('.segment-row').first().click();
   assert.equal(await page.locator('#observation').inputValue(), '浏览器验证：视频色块在 1–3 秒可见。');
   check('cached application reload and local media restore work offline');
   await context.setOffline(false);
 
-  const secondTab = await context.newPage(); await secondTab.goto(origin);
+  const secondTab = await context.newPage(); await secondTab.goto(origin); await restoreLatest(secondTab);
   await secondTab.waitForSelector('#workspace:not([hidden])');
   await secondTab.locator('#assignment-id').fill('NEW_TAB_NOTE');
   await secondTab.waitForFunction(() => document.getElementById('draft-status').textContent.includes('草稿已存浏览器'));
   await page.locator('#assignment-id').fill('STALE_TAB_NOTE');
   await page.waitForFunction(() => document.getElementById('draft-status').textContent.includes('另一个标签页'));
-  await secondTab.reload(); await secondTab.waitForSelector('#workspace:not([hidden])');
+  await secondTab.reload(); await restoreLatest(secondTab); await secondTab.waitForSelector('#workspace:not([hidden])');
   assert.equal(await secondTab.locator('#assignment-id').inputValue(), 'NEW_TAB_NOTE');
   await secondTab.close();
   check('stale browser tabs cannot overwrite another tab\'s newer draft');
@@ -280,7 +301,7 @@ try {
   await page.locator('#setting-step').selectOption('0.5');
   await page.locator('#save-settings').click();
   await page.waitForFunction(() => document.getElementById('draft-status').textContent.includes('草稿已存'));
-  await page.reload();
+  await page.reload(); await restoreLatest();
   await page.waitForSelector('#workspace:not([hidden])');
   await page.locator('#folder-input').setInputFiles(taskDir);
   await page.waitForFunction(() => document.getElementById('video').readyState >= 2);
@@ -338,7 +359,7 @@ try {
   assert.equal(audioExport.media_type, 'audio'); assert.equal(audioExport.status, 'complete');
   assert.equal(audioExport.segments[0].start_time, .5); assert.equal(audioExport.segments[0].end_time, 2);
   assert.equal(mp3Export.items.find(i => i.id === 'video_demo_1').segments[0].annotations.local_fact, '时间修改后保留的局部事实');
-  await page.reload(); await page.waitForSelector('#workspace:not([hidden])');
+  await page.reload(); await restoreLatest(); await page.waitForSelector('#workspace:not([hidden])');
   await page.locator('#attach-input').setInputFiles(mp3Path);
   await page.waitForFunction(() => document.getElementById('audio').readyState >= 2);
   await page.locator('.segment-row').first().click();
@@ -383,7 +404,7 @@ try {
   assert.equal(removed.items.some(i => i.id === 'video_demo_1'), false);
   assert.ok(removed.items.find(i => i.id === 'tone.mp3').segments.length >= 1);
   assert.ok(fs.existsSync(mp4Path));
-  await page.reload(); await page.waitForSelector('#workspace:not([hidden])');
+  await page.reload(); await restoreLatest(); await page.waitForSelector('#workspace:not([hidden])');
   assert.equal(await page.locator('.task-item').count(), previousCount);
   assert.equal(await page.locator('.task-item[data-media-type=video]').count(), 0);
   check('task removal respects cancel, removes only selected records, persists after reload and keeps the source file');

@@ -56,6 +56,14 @@
 .g-choice-notice{font-size:11px;line-height:1.7;color:#6c755e;margin:5px 10px 9px}
 .g-unsaved-note{font-size:12px;line-height:1.5;color:#8a6428;margin-left:auto;white-space:nowrap}.g-unsaved-note[hidden]{display:none}
 
+/* Subject identity flows from the selected evidence instead of a global list. */
+.g-subject-lineage{position:relative;min-width:0}.g-subject-lineage>.g-hint{margin:7px 0 0}
+.g-inherited-subject{display:flex;flex-direction:column;gap:5px;padding:12px;border:1px solid var(--g-line);border-left:3px solid var(--g-accent);background:var(--g-soft);border-radius:4px;overflow-wrap:anywhere}
+.g-inherited-subject strong{font-size:14px;color:var(--g-ink);font-weight:600}.g-inherited-subject span{font-size:11px;color:#536352}.g-inherited-subject[hidden]{display:none}
+.g-subject-lineage.is-single .g-choice-picker,.g-subject-lineage.is-empty .g-choice-picker{border:0;background:transparent;position:static}
+.g-subject-lineage.is-single .g-choice-picker>:not(select),.g-subject-lineage.is-empty .g-choice-picker>:not(select){display:none}
+.g-subject-lineage.is-single select.g-subject-input,.g-subject-lineage.is-empty select.g-subject-input{position:absolute;top:0;left:0;width:1px;height:1px;min-height:1px;padding:0;border:0;opacity:0;pointer-events:none}
+
 /* Explicit relation semantics and navigable large-graph views. */
 .g-event-relation-list{display:grid;gap:9px;margin:10px 0 16px}
 .g-event-relation-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(185px,230px);align-items:center;gap:12px;padding:11px 12px;border:1px solid var(--g-line,#d5d9d1);border-radius:4px;background:var(--g-soft,#f4f5f0);font-size:13px;line-height:1.7}

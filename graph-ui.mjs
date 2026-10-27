@@ -1,5 +1,6 @@
 import { blankGraph, evidenceNodes, evidenceBounds, normalizeGraph, graphIssues, invalidateEvidence, removeGraphNode } from './graph.mjs';
 import { graphViewLinks, projectGraphView, serializeFullGraphSVG } from './graph-view.mjs';
+import { createSubjectResolver } from './subject-lineage.mjs';
 
 const STAGES = [['evidence', '证据'], ['facts', '事实'], ['events', '复合事件'], ['emotions', '情感脉络'], ['graph', '关联图谱']];
 const COLLECTION = { entity: 'entities', mention: 'mentions', fact: 'facts', event: 'events', emotion_state: 'emotion_states', emotion_transition: 'emotion_transitions' };
@@ -19,11 +20,12 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
   let graphPage = 0;
   const selected = { entity: '', mention: '', fact: '', event: '', emotion_state: '', emotion_transition: '' };
   let factSeed = null, graphFocus = null, showManagement = false;
+  let subjectWorkspace = null, subjects = null;
   const fieldDrafts = new Map(), fieldBaselines = new Map(), dirtyFields = new Set(); let renderedContext = null, savingContext = null;
   const controlSignature = element => JSON.stringify(element.multiple ? [...element.selectedOptions].map(option => option.value) : element.value);
   function draftKey(element, context) {
     const prefix = element.id.startsWith('g-fact-') ? 'fact' : element.id.startsWith('g-event-') ? 'event' : element.id.startsWith('g-state-') ? 'emotion_state' : element.id.startsWith('g-transition-') ? 'emotion_transition' : element.id.startsWith('g-entity-') ? 'entity' : element.id.startsWith('g-mention-') ? 'mention' : 'alignment';
-    return JSON.stringify([context.workspace, prefix, context.selected[prefix] || '', element.dataset.itemId || '', element.id]);
+    return JSON.stringify([context.workspace, prefix, context.selected[prefix] || '', element.dataset.itemId || (!context.selected[prefix] && ['fact', 'event', 'emotion_state', 'emotion_transition'].includes(prefix) ? context.itemID || '' : ''), element.id]);
   }
   function captureFields() {
     if (!renderedContext) return;
@@ -35,6 +37,7 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
     }
   }
   function clearFormContext(type, id = '', itemID) {
+    if (!id && itemID === undefined && ['fact', 'event', 'emotion_state', 'emotion_transition'].includes(type)) itemID = currentItemID();
     for (const key of fieldDrafts.keys()) { const context = JSON.parse(key); if (context[0] === ws()?.id && context[1] === type && context[2] === id && (itemID === undefined || context[3] === itemID)) { fieldDrafts.delete(key); fieldBaselines.delete(key); dirtyFields.delete(key); } }
   }
   function pruneRemovedContexts() {
@@ -62,10 +65,17 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
   }
   function restoreFields(context) {
     for (const element of body.querySelectorAll('input[id],select[id],textarea[id]')) {
-      const key = draftKey(element, context), saved = fieldDrafts.get(key);
+      const key = draftKey(element, context); let saved = fieldDrafts.get(key);
       if (saved === undefined || (!element.dataset.graphFilter && !dirtyFields.has(key))) continue;
+      if (element.matches('select') && element.closest('.g-subject-lineage')) {
+        const allowed = [...element.options].map(option => option.value).filter(Boolean);
+        if (element.multiple) {
+          saved = saved.filter(id => allowed.includes(id));
+          if (!saved.length && allowed.length === 1) saved = [allowed[0]];
+        } else if (!allowed.includes(saved)) saved = allowed.length === 1 ? allowed[0] : '';
+      }
       if (element.multiple) { for (const option of element.options) option.selected = saved.includes(option.value); element.dispatchEvent(new Event('graph:sync-options')); }
-      else { const previous = element.value; element.value = saved; if (element.id === 'g-transition-subject' && previous !== saved) element.dispatchEvent(new Event('change')); }
+      else { const previous = element.value; element.value = saved; if (element.id === 'g-transition-subject' && previous !== saved) element.dispatchEvent(new Event('change', { bubbles: true })); }
       if (element.dataset.graphFilter) element.dispatchEvent(new Event('graph:sync-filter'));
       if (element.dataset.graphTracked !== undefined) element.dataset.graphTracked = controlSignature(element);
     }
@@ -90,6 +100,18 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
   const report = (text, error = false) => { feedback.textContent = text; feedback.hidden = !text; feedback.classList.toggle('error', error); };
   const linksTo = (toType, toID, fromType) => graph().links.filter(link => link.to_type === toType && link.to_id === toID && (!fromType || link.from_type === fromType));
   const entityName = id => find('entity', id)?.name || id || '未指定主体';
+  const currentItemID = () => ws()?.manifest.items[ws().index || 0]?.id || '';
+  const formContext = () => ({ workspace: ws().id, itemID: currentItemID(), selected: { ...selected } });
+  const taskSubjects = () => subjects.forItem(currentItemID());
+  function mergeSubjects(...lists) {
+    const merged = new Map();
+    for (const candidate of lists.flat()) {
+      const previous = merged.get(candidate.id);
+      merged.set(candidate.id, previous ? { ...previous, evidence_ids: [...new Set([...previous.evidence_ids, ...candidate.evidence_ids])] } : candidate);
+    }
+    return [...merged.values()];
+  }
+  const savedSubjects = ids => (ids || []).flatMap(id => { const entity = find('entity', id); return entity ? [{ ...entity, evidence_ids: [], pending: false }] : []; });
   const MODALITY_NAME = { visual_observation: '视觉观察', speech_content: '言语内容', acoustic_observation: '声学观察', other: '其他证据', unclassified: '待分类' };
   const evidenceLabel = entry => `${entry.title || entry.item_id} · ${MODALITY_NAME[entry.modality] || '证据'} · 局部 ${numberText(entry.start_time)}–${numberText(entry.end_time)} · 共同 ${numberText(entry.global_start_time)}–${numberText(entry.global_end_time)} @ ${entry.timeline_id}`;
   function labelFor(type, id) {
@@ -104,7 +126,7 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
     return entry.description || entry.id;
   }
   function field(text, element, hint = '') {
-    const grouped = element.classList.contains('g-choice-picker');
+    const grouped = element.classList.contains('g-choice-picker') || element.classList.contains('g-subject-lineage');
     const label = node(grouped ? 'div' : 'label', 'g-field');
     const caption = node('span', 'g-field-label', text);
     if (grouped) { caption.id = `${element.dataset.controlId}-caption`; label.setAttribute('role', 'group'); label.setAttribute('aria-labelledby', caption.id); }
@@ -166,6 +188,49 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
     picker.append(element, header, search, list, notice); renderCards(); return picker;
   }
   const entityOptions = () => graph().entities.map(entry => ({ value: entry.id, label: entry.name }));
+  function inheritedSubject(id, candidatesFor, initial = [], { multiple = false, source = '证据', preserve = false } = {}) {
+    const wrapper = node('div', 'g-subject-lineage'); wrapper.dataset.controlId = id;
+    const controlHost = node('div', 'g-subject-control'), summary = node('div', 'g-inherited-subject'), hint = node('p', 'g-hint');
+    wrapper.append(summary, controlHost, hint);
+    let candidates = [], current = [...initial], keepSaved = preserve;
+    const available = () => mergeSubjects(candidatesFor(), keepSaved ? savedSubjects(initial) : []);
+    const read = () => { const control = wrapper.querySelector(`#${id}`); return !control ? [] : multiple ? [...control.selectedOptions].map(option => option.value) : control.value ? [control.value] : []; };
+    function paint() {
+      candidates = available();
+      const allowed = new Set(candidates.map(candidate => candidate.id));
+      current = current.filter(id => allowed.has(id));
+      if (!current.length && candidates.length === 1 && (!keepSaved || !initial.length)) current = [candidates[0].id];
+      const options = candidates.map(candidate => ({ value: candidate.id, label: candidate.name, meta: `沿用${source}中标注的主体` }));
+      const selector = select(id, multiple ? options : [{ value: '', label: candidates.length ? '选择本条对应的主体' : '尚无已标主体' }, ...options], multiple ? current : current[0] || '', multiple);
+      const control = multiple ? selector.querySelector('select') : selector;
+      control.classList.add('g-subject-input');
+      controlHost.replaceChildren(selector);
+      const single = candidates.length === 1;
+      wrapper.classList.toggle('is-single', single); wrapper.classList.toggle('is-empty', !candidates.length);
+      if (!multiple) { control.tabIndex = single || !candidates.length ? -1 : 0; control.setAttribute('aria-hidden', String(single || !candidates.length)); }
+      summary.replaceChildren();
+      if (single) { summary.append(node('strong', '', candidates[0].name), node('span', '', `沿用${source}主体`)); }
+      summary.hidden = !single;
+      hint.textContent = !candidates.length ? `请先在${source}中标注主体；此处不会预设人物。` : single ? '已自动带入，无需重复选择。' : `仅显示${source}中的主体，请确认本条对应的对象。`;
+      control.addEventListener('change', () => { current = read(); });
+      return control;
+    }
+    paint();
+    wrapper.refreshSubjects = (notify = false) => {
+      const previous = JSON.stringify(read()); current = read();
+      if (notify) keepSaved = false;
+      const next = available();
+      const unchanged = JSON.stringify(candidates.map(({ id, name }) => [id, name])) === JSON.stringify(next.map(({ id, name }) => [id, name]));
+      const control = unchanged ? wrapper.querySelector(`#${id}`) : paint();
+      if (unchanged) candidates = next;
+      wrapper.dispatchEvent(new Event('graph:subjects-refreshed'));
+      if (notify && previous !== JSON.stringify(read())) control.dispatchEvent(new Event('change', { bubbles: true }));
+    };
+    wrapper.commitSubjects = () => {
+      const chosen = new Set(read()); subjects.commit(candidates.filter(candidate => chosen.has(candidate.id)));
+    };
+    return wrapper;
+  }
   const factOptions = () => graph().facts.map(entry => ({ value: entry.id, label: short(entry.text, 85), title: entry.text || '未填写事实', meta: `${entry.subject_ids.map(entityName).join('、') || '未指定主体'} · ${REVIEW_NAME[entry.review_status] || '草稿'}` }));
   const eventOptions = () => graph().events.map(entry => ({ value: entry.id, label: entry.title, title: entry.title, meta: `${entry.subject_ids.map(entityName).join('、')} · ${REVIEW_NAME[entry.review_status] || '草稿'}` }));
   const evidenceOptions = () => evidence().map(entry => ({ value: entry.id, label: evidenceLabel(entry), kind: 'evidence', title: `${entry.title || entry.item_id} · ${MODALITY_NAME[entry.modality] || '证据'}`, meta: `局部 ${numberText(entry.start_time)}–${numberText(entry.end_time)} · 共同 ${numberText(entry.global_start_time)}–${numberText(entry.global_end_time)} @ ${entry.timeline_id}` }));
@@ -383,13 +448,19 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
     const refs = fact ? linksTo('fact', fact.id, 'evidence').map(link => link.from_id) : seed?.evidence_ids || [];
     form.append(node('h3', '', fact ? '编辑事实' : '新增事实'), node('p', 'g-hint', '用第三人称客观描述。例：“A 称 B 已离职”描述的是 A 的陈述，不能直接认定 B 已离职。'));
     form.append(field('客观事实描述', textarea('g-fact-text', fact?.text || seed?.text || '')), field('事实类型', select('g-fact-kind', [{ value: 'observation', label: '观察事实' }, { value: 'reported_speech', label: '人物陈述 / 转述事实' }], fact?.kind || 'observation')));
-    const pair = node('div', 'g-form-pair'); pair.append(field('事实描述的主体', select('g-fact-subjects', entityOptions(), fact?.subject_ids || seed?.subject_ids || [], true), '可多选；这里选被描述的人，不是标注员。'), field('发言者（人物陈述）', select('g-fact-speaker', [{ value: '', label: '观察事实无需选择' }, ...entityOptions()], fact?.speaker_id || ''), '上例被描述主体为 B，发言者为 A。')); form.append(pair);
+    const candidateSubjects = () => { const ids = form.querySelector('#g-fact-evidence') ? values('g-fact-evidence') : refs; return ids.length ? subjects.fromEvidence(ids) : taskSubjects(); };
+    const subjectField = inheritedSubject('g-fact-subjects', candidateSubjects, fact?.subject_ids || seed?.subject_ids || [], { multiple: true, source: '证据', preserve: !!fact });
+    const speakerField = inheritedSubject('g-fact-speaker', candidateSubjects, fact?.speaker_id ? [fact.speaker_id] : [], { source: '证据', preserve: !!fact });
+    const pair = node('div', 'g-form-pair'); pair.append(field('事实主体', subjectField), field('发言者（人物陈述）', speakerField, '被描述主体与发言者分别记录；观察事实不保存发言者。')); form.append(pair);
     form.append(field('支持证据', select('g-fact-evidence', evidenceOptions(), refs, true), '可勾选多个已对齐的音视频窗；同一证据可支持不同事实。'), reviewField('g-fact', fact?.review_status));
+    form.querySelector('#g-fact-kind').addEventListener('change', () => { speakerField.closest('.g-field').hidden = value('g-fact-kind') !== 'reported_speech'; });
+    form.querySelector('#g-fact-evidence').addEventListener('change', () => { subjectField.refreshSubjects(true); speakerField.refreshSubjects(true); });
     trackForm(form, 'g-fact');
     saveActions(form, 'fact', () => changedGraph(() => {
       const text = value('g-fact-text').trim(), subjects = values('g-fact-subjects'), evidenceIDs = values('g-fact-evidence'), kind = value('g-fact-kind'), speaker = value('g-fact-speaker');
       requireValue(text, '请填写事实描述'); requireValue(subjects.length, '请至少选择一个主体'); requireValue(evidenceIDs.length, '请选择支持事实的证据窗');
       if (kind === 'reported_speech') requireValue(speaker, '陈述事实必须注明说话主体');
+      subjectField.commitSubjects(); if (kind === 'reported_speech') speakerField.commitSubjects();
       const id = fact?.id || crypto.randomUUID(), entry = { id, text, subject_ids: subjects, kind, speaker_id: kind === 'reported_speech' ? speaker : '', review_status: value('g-fact-review') };
       if (fact && (nodeSignature(fact) !== nodeSignature(entry) || !sameMembers(refs, evidenceIDs))) markDependents('fact', id);
       upsert('fact', entry);
@@ -404,16 +475,18 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
     const form = node('div', 'g-card g-form'), event = find('event', selected.event);
     const refs = event ? linksTo('event', event.id, 'fact').map(link => link.from_id) : [];
     form.append(node('h3', '', event ? '编辑复合事件' : '新增复合事件'), node('p', 'g-hint', '把事实精练为“谁做了什么、对象或结果是什么”的具体事件，避免把情绪或人格判断写成事件。'));
-    form.append(field('事件名称 / 简练描述', textarea('g-event-title', event?.title || '', 2)), field('参与主体', select('g-event-subjects', entityOptions(), event?.subject_ids || [], true), multipleHint), field('构成这个事件的事实', select('g-event-facts', factOptions(), refs, true), multipleHint));
+    const subjectField = inheritedSubject('g-event-subjects', () => { const ids = form.querySelector('#g-event-facts') ? values('g-event-facts') : refs; return ids.length ? subjects.fromFacts(ids) : taskSubjects(); }, event?.subject_ids || [], { multiple: true, source: '事实', preserve: !!event });
+    form.append(field('事件名称 / 简练描述', textarea('g-event-title', event?.title || '', 2)), field('参与主体', subjectField), field('构成这个事件的事实', select('g-event-facts', factOptions(), refs, true), multipleHint));
     const timing = node('p', 'g-derived-time');
     function updateTiming() { try { const bounds = boundsForFacts(values('g-event-facts')); timing.textContent = bounds ? `支持证据覆盖范围：${bounds.timeline_id} · ${rangeText(bounds)}` : '选择事实后显示支持证据覆盖范围'; } catch (error) { timing.textContent = error.message; } }
     form.append(timing, reviewField('g-event', event?.review_status));
     trackForm(form, 'g-event');
-    form.querySelector('#g-event-facts').addEventListener('change', updateTiming);
+    form.querySelector('#g-event-facts').addEventListener('change', () => { subjectField.refreshSubjects(true); updateTiming(); });
     saveActions(form, 'event', () => changedGraph(() => {
       const title = value('g-event-title').trim(), subjects = values('g-event-subjects'), facts = values('g-event-facts');
       requireValue(title && subjects.length && facts.length, '请填写事件描述，并选择参与主体及构成事实');
       const bounds = boundsForFacts(facts); requireValue(bounds, '所选事实缺少证据，无法确定事件时间轴');
+      subjectField.commitSubjects();
       const id = event?.id || crypto.randomUUID(), entry = { id, title, subject_ids: subjects, timeline_id: bounds.timeline_id, review_status: value('g-event-review') };
       if (event && (nodeSignature(event) !== nodeSignature(entry) || !sameMembers(refs, facts))) markDependents('event', id);
       upsert('event', entry);
@@ -431,11 +504,17 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
     const timelines = [...new Set(evidence().map(entry => entry.timeline_id))];
     if (state?.timeline_id && !timelines.includes(state.timeline_id)) timelines.push(state.timeline_id);
     form.append(node('h3', '', state ? '编辑情感状态' : '新增情感状态'), node('p', 'g-hint', '“皱眉、提高音量”先记为事实；“不满、紧张”是依据事实作出的情感判断。稳定情感可只记录一个状态。'));
-    const first = node('div', 'g-form-pair'); first.append(field('主体', select('g-state-subject', [{ value: '', label: '请选择主体' }, ...entityOptions()], state?.subject_id || '')), field('情感标签', input('g-state-label', state?.label || ''))); form.append(first);
+    const stateEvents = state ? linksTo('emotion_state', state.id, 'event').map(link => link.from_id) : [];
+    const subjectField = inheritedSubject('g-state-subject', () => {
+      const facts = form.querySelector('#g-state-facts') ? values('g-state-facts') : refs;
+      const events = form.querySelector('#g-state-events') ? values('g-state-events') : stateEvents;
+      return facts.length ? subjects.fromFacts(facts) : events.length ? subjects.fromEvents(events) : taskSubjects();
+    }, state?.subject_id ? [state.subject_id] : [], { source: '事实', preserve: !!state });
+    const first = node('div', 'g-form-pair'); first.append(field('主体', subjectField), field('情感标签', input('g-state-label', state?.label || ''))); form.append(first);
     const second = node('div', 'g-form-pair'); second.append(field('共同时间轴', select('g-state-timeline', timelines.map(id => ({ value: id, label: id })), state?.timeline_id || timelines[0] || '')), field('强度（可选）', select('g-state-intensity', [{ value: '', label: '未标强度' }, ...[1, 2, 3, 4, 5].map(n => ({ value: String(n), label: String(n) }))], state?.intensity == null ? '' : String(state.intensity)))); form.append(second);
     const times = node('div', 'g-form-pair'); times.append(field('共同时间起点 / 秒', input('g-state-start', state?.start_time ?? '', 'number')), field('共同时间终点 / 秒', input('g-state-end', state?.end_time ?? '', 'number'))); form.append(times);
-    const stateEvents = state ? linksTo('emotion_state', state.id, 'event').map(link => link.from_id) : [];
     form.append(field('情感判断的事实依据', select('g-state-facts', factOptions(), refs, true), multipleHint), field('关联的复合事件', select('g-state-events', eventOptions(), stateEvents, true), '稳定情感状态可直接关联事件，无需人为制造一次情绪变化。' + multipleHint));
+    for (const id of ['g-state-facts', 'g-state-events']) form.querySelector(`#${id}`).addEventListener('change', () => subjectField.refreshSubjects(true));
     form.append(button('按所选事实的证据范围填入时间', () => {
       try { const bounds = boundsForFacts(values('g-state-facts')); requireValue(bounds, '先选择有证据的事实'); root.querySelector('#g-state-timeline').value = bounds.timeline_id; root.querySelector('#g-state-start').value = bounds.start_time; root.querySelector('#g-state-end').value = bounds.end_time; root.querySelector('#g-state-review').value = 'needs_review'; }
       catch (error) { report(error.message, true); }
@@ -445,6 +524,7 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
       const subject = value('g-state-subject'), label = value('g-state-label').trim(), timeline = value('g-state-timeline'), start = value('g-state-start'), end = value('g-state-end'), facts = values('g-state-facts'), events = values('g-state-events');
       requireValue(subject && label && timeline && start !== '' && end !== '' && facts.length, '请填写主体、情感、时间和事实依据');
       requireValue(Number.isFinite(Number(start)) && Number.isFinite(Number(end)) && Number(end) > Number(start), '情感状态的终点必须大于起点');
+      subjectField.commitSubjects();
       const id = state?.id || crypto.randomUUID(), entry = { id, subject_id: subject, label, timeline_id: timeline, start_time: Number(start), end_time: Number(end), intensity: value('g-state-intensity') === '' ? null : Number(value('g-state-intensity')), review_status: value('g-state-review') };
       if (state && (nodeSignature(state) !== nodeSignature(entry) || !sameMembers(refs, facts) || !sameMembers(stateEvents, events))) markDependents('emotion_state', id);
       upsert('emotion_state', entry);
@@ -457,15 +537,32 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
     const transitionLayout = node('div', 'g-editor-layout'); transitionLayout.append(nodeList('emotion_transition', '情感变化'));
     const transitionForm = node('div', 'g-card g-form'), transition = find('emotion_transition', selected.emotion_transition);
     const eventLinks = transition ? linksTo('emotion_transition', transition.id, 'event') : [];
-    const selectedSubject = transition?.subject_id || graph().entities[0]?.id || '';
+    const transitionSubjects = () => {
+      const fromID = transitionForm.querySelector('#g-transition-from')?.value || transition?.from_state_id;
+      const toID = transitionForm.querySelector('#g-transition-to')?.value || transition?.to_state_id;
+      const saved = [fromID, toID].flatMap(id => { const state = find('emotion_state', id); return state ? savedSubjects([state.subject_id]) : []; });
+      return saved.length ? mergeSubjects(saved) : taskSubjects();
+    };
+    const inherited = inheritedSubject('g-transition-subject', transitionSubjects, transition?.subject_id ? [transition.subject_id] : [], { source: '状态与证据', preserve: !!transition });
+    const subject = inherited.querySelector('select');
+    const selectedSubject = subject.value;
     transitionForm.append(node('h3', '', transition ? '编辑情感变化' : '新增情感变化'), node('p', 'g-hint', '连接同一主体的前后状态。事件默认只表示关联；因果需要另行作出人工判断并填写依据。'));
-    const subject = select('g-transition-subject', entityOptions(), selectedSubject);
     const states = () => graph().emotion_states.filter(entry => entry.subject_id === value('g-transition-subject')).map(entry => ({ value: entry.id, label: `${entry.label} · ${entry.timeline_id} · ${rangeText(entry)}` }));
-    transitionForm.append(field('主体', subject));
+    transitionForm.append(field('主体', inherited));
     const statePair = node('div', 'g-form-pair');
     const initialStates = graph().emotion_states.filter(entry => entry.subject_id === selectedSubject).map(entry => ({ value: entry.id, label: `${entry.label} · ${entry.timeline_id} · ${rangeText(entry)}` }));
     statePair.append(field('变化前的状态', select('g-transition-from', [{ value: '', label: '请选择状态' }, ...initialStates], transition?.from_state_id || '')), field('变化后的状态', select('g-transition-to', [{ value: '', label: '请选择状态' }, ...initialStates], transition?.to_state_id || ''))); transitionForm.append(statePair);
-    subject.addEventListener('change', () => { for (const id of ['g-transition-from', 'g-transition-to']) { const old = root.querySelector(`#${id}`); old.replaceChildren(...select('unused', [{ value: '', label: '请选择状态' }, ...states()]).children); } });
+    function syncTransitionStates() {
+      const available = states();
+      for (const id of ['g-transition-from', 'g-transition-to']) {
+        const control = transitionForm.querySelector(`#${id}`); if (!control) continue;
+        const previous = control.value;
+        control.replaceChildren(...select('unused', [{ value: '', label: '请选择状态' }, ...available], previous).children);
+        control.value = available.some(option => option.value === previous) ? previous : '';
+      }
+    }
+    inherited.addEventListener('change', syncTransitionStates);
+    inherited.addEventListener('graph:subjects-refreshed', syncTransitionStates);
     const relationOptions = [{ value: 'associated_with', label: '关联：不作因果断言' }, { value: 'causes', label: '因果判断（需填写依据）' }];
     const eventPicker = select('g-transition-events', eventOptions(), eventLinks.map(link => link.from_id), true);
     const eventSelect = eventPicker.querySelector('select');
@@ -476,7 +573,7 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
     const eventRelationControls = new Map();
     let previousEvents = [...eventSelect.selectedOptions].map(option => option.value);
     const relationID = id => 'g-transition-event-relation-' + [...new TextEncoder().encode(id)].map(byte => byte.toString(16).padStart(2, '0')).join('');
-    const context = () => ({ workspace: ws().id, selected: { ...selected } });
+    const context = formContext;
     function syncEventRelations(restoreDrafts = true) {
       if (previousEvents.length === 1) eventRelationValues.set(previousEvents[0], relation.value);
       if (previousEvents.length > 1) for (const [id, control] of eventRelationControls) eventRelationValues.set(id, control.value);
@@ -516,6 +613,7 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
       const subjectID = value('g-transition-subject'), from = value('g-transition-from'), to = value('g-transition-to'), events = values('g-transition-events');
       requireValue(subjectID && from && to && from !== to, '请选择同一主体的两个不同情感状态'); requireValue(events.length, '请选择关联这一情感变化的事件');
       const id = transition?.id || crypto.randomUUID();
+      inherited.commitSubjects();
       upsert('emotion_transition', { id, subject_id: subjectID, from_state_id: from, to_state_id: to, note: value('g-transition-note').trim(), review_status: value('g-transition-review') });
       const previous = linksTo('emotion_transition', id, 'event');
       const desired = events.map(eventID => ({ eventID, type: events.length === 1 ? relation.value : eventRelationControls.get(eventID)?.value || eventRelationValues.get(eventID) || 'associated_with' }));
@@ -708,6 +806,11 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
       fieldDrafts.clear(); fieldBaselines.clear(); dirtyFields.clear(); renderedContext = null;
     }
     if (!workspace.graph) workspace.graph = blankGraph();
+    if (subjectWorkspace !== workspace) { subjectWorkspace = workspace; subjects = createSubjectResolver(workspace); }
+    if (renderedContext?.itemID && renderedContext.itemID !== currentItemID()) {
+      for (const type of ['fact', 'event', 'emotion_state', 'emotion_transition']) selected[type] = '';
+      factSeed = null;
+    }
     if (graphFocus && !find(graphFocus.type, graphFocus.id)) { graphFocus = null; graphPage = 0; }
     root.dataset.stage = activeStage;
     const counts = { evidence: evidence().length, facts: graph().facts.length, events: graph().events.length, emotions: graph().emotion_states.length + graph().emotion_transitions.length };
@@ -727,17 +830,21 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
     else if (activeStage === 'emotions') body.append(emotionsPanel());
     else if (activeStage === 'graph') body.append(graphPanel());
     if (activeStage !== 'evidence') body.append(management());
-    const context = { workspace: workspace.id, selected: { ...selected } };
-    recordBaselines(context); restoreFields(context); renderedContext = context; captureFields(); updateUnsavedNote();
+    const context = formContext();
+    recordBaselines(context); restoreFields(context);
+    for (const wrapper of body.querySelectorAll('.g-subject-lineage')) wrapper.refreshSubjects();
+    restoreFields(context);
+    const speaker = body.querySelector('#g-fact-speaker'); if (speaker) speaker.closest('.g-field').hidden = value('g-fact-kind') !== 'reported_speech';
+    renderedContext = context; captureFields(); updateUnsavedNote();
   }
   function openFactFromEvidence(id) {
     const entry = find('evidence', id); if (!entry) return report('请先选择有效证据时间窗', true);
     const segment = ws().records[entry.item_id]?.segments.find(segment => segment.id === entry.segment_id);
     captureFields();
-    const pendingFact = [...dirtyFields].some(key => { const [workspace, type, nodeID] = JSON.parse(key); return workspace === ws().id && type === 'fact' && !nodeID; });
+    const pendingFact = [...dirtyFields].some(key => { const [workspace, type, nodeID, itemID] = JSON.parse(key); return workspace === ws().id && type === 'fact' && !nodeID && itemID === currentItemID(); });
     if (pendingFact && !window.confirm('当前新增事实还有未保存内容。放弃这份草稿，并从所选证据重新整理事实？')) return false;
     clearFormContext('fact', ''); renderedContext = null;
-    selected.fact = ''; factSeed = { text: segment?.annotations?.local_fact || segment?.annotations?.observation || '', evidence_ids: [id], subject_ids: graph().entities.some(entity => entity.id === segment?.annotations?.subject_id) ? [segment.annotations.subject_id] : [] };
+    selected.fact = ''; factSeed = { text: segment?.annotations?.local_fact || segment?.annotations?.observation || '', evidence_ids: [id], subject_ids: subjects.fromEvidence([id]).map(candidate => candidate.id) };
     stage('facts'); report('已带入当前证据和文本。请核对主体与事实表述后保存；没有自动确认。');
   }
   render();
