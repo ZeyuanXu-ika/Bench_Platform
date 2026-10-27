@@ -87,23 +87,22 @@ try {
   await page.locator('#g-fact-text').fill('UNSAVED_FACT_A');
   await stage('evidence');
   await page.locator('.segment-row').nth(1).click();
-  let cancelObserved = false;
-  page.once('dialog', async dialog => { cancelObserved = true; await dialog.dismiss(); });
   await page.locator('#build-fact').click();
-  assert.equal(cancelObserved, true, 'Replacing a dirty new fact must require explicit confirmation');
   assert.equal(await page.locator('.g-tab.active').getAttribute('data-stage'), 'evidence');
   await stage('facts'); assert.equal(await page.locator('#g-fact-text').inputValue(), 'UNSAVED_FACT_A');
   await stage('evidence');
-  let acceptObserved = false;
-  page.once('dialog', async dialog => { acceptObserved = true; await dialog.accept(); });
   await page.locator('#build-fact').click();
+  assert.equal(await page.locator('.g-tab.active').getAttribute('data-stage'), 'evidence');
+  await stage('facts');
   await page.waitForSelector('#g-fact-text');
-  assert.equal(acceptObserved, true);
-  assert.equal(await page.locator('#g-fact-text').inputValue(), template.items[0].segments[1].annotations.observation);
-  assert.deepEqual(await page.locator('#g-fact-evidence').evaluate(select => [...select.selectedOptions].map(option => option.value)), [ev('demo_video', 'v2')]);
-  await page.locator('#g-fact-subjects').selectOption('demo_subject');
-  await page.locator('#g-fact-review').selectOption('confirmed'); await save(kinds[0]);
-  check('replacing a dirty new fact requires confirmation; cancel retains its text and accept alone loads the new evidence seed');
+  assert.equal(await page.locator('#g-fact-text').inputValue(), 'UNSAVED_FACT_A');
+  const independentlySaved = await downloadJSON('inline-save-retains-advanced-draft');
+  const sourceWindow = independentlySaved.items[0].segments[1];
+  const inlineFact = independentlySaved.graph.facts.find(fact => fact.id === sourceWindow.annotations.fact_id);
+  assert.ok(inlineFact); assert.equal(inlineFact.text, sourceWindow.annotations.observation);
+  assert.deepEqual(inlineFact.subject_ids, ['demo_subject']);
+  assert.equal(independentlySaved.graph.links.filter(link => link.to_id === inlineFact.id && link.from_id === ev('demo_video', 'v2')).length, 1);
+  check('saving a fact beside its evidence stays in place and preserves an unrelated unsaved advanced fact draft');
 
   for (const kind of kinds) {
     const reordered = reviewedFixture(); reordered.graph.links.reverse();

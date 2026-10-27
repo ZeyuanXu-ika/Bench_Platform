@@ -1,8 +1,9 @@
 import { blankGraph, evidenceNodes, evidenceBounds, normalizeGraph, graphIssues, invalidateEvidence, removeGraphNode } from './graph.mjs';
 import { graphViewLinks, projectGraphView, serializeFullGraphSVG } from './graph-view.mjs';
 import { createSubjectResolver } from './subject-lineage.mjs';
+import { setEvidenceSubjects } from './evidence-fact.mjs';
 
-const STAGES = [['evidence', '证据'], ['facts', '事实'], ['events', '复合事件'], ['emotions', '情感脉络'], ['graph', '关联图谱']];
+const STAGES = [['evidence', '证据与事实'], ['facts', '事实汇总'], ['events', '复合事件'], ['emotions', '情感脉络'], ['graph', '关联图谱']];
 const COLLECTION = { entity: 'entities', mention: 'mentions', fact: 'facts', event: 'events', emotion_state: 'emotion_states', emotion_transition: 'emotion_transitions' };
 const TYPE_NAME = { evidence: '证据', entity: '主体', mention: '提及', fact: '事实', event: '复合事件', emotion_state: '情感状态', emotion_transition: '情感变化' };
 const RELATION_NAME = { supports: '支持', constitutes: '构成', grounds: '情感判断依据', associated_with: '关联', causes: '导致（人工判断）' };
@@ -13,7 +14,7 @@ const short = (text, length = 55) => String(text || '').length > length ? String
 const numberText = value => Number.isFinite(value) ? `${Math.round(value * 1000) / 1000}s` : '—';
 const rangeText = value => value ? `${numberText(value.start_time)} → ${numberText(value.end_time)}` : '尚未关联时间范围';
 
-export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvidence }) {
+export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvidence, onFactSaved }) {
   root.classList.add('graph-workbench');
   let activeStage = 'evidence';
   let graphFit = true;
@@ -266,18 +267,21 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
     return JSON.stringify(result);
   }
   function changedGraph(mutator, message, context = savingContext) {
-    const workspace = ws(), previous = structuredClone(workspace.graph);
+    const workspace = ws(), previous = structuredClone({ graph: workspace.graph, records: workspace.records, manifest: workspace.manifest });
     try {
       captureFields();
       workspace.graph.status = 'draft'; mutator();
-      const modified = graphSignature(previous) !== graphSignature(workspace.graph);
-      if (!modified) workspace.graph.status = previous.status;
+      const graphModified = graphSignature(previous.graph) !== graphSignature(workspace.graph);
+      const modified = graphModified || JSON.stringify(previous.records) !== JSON.stringify(workspace.records) || JSON.stringify(previous.manifest) !== JSON.stringify(workspace.manifest);
+      if (!graphModified) workspace.graph.status = previous.graph.status;
       workspace.graph = normalizeGraph(workspace.graph, workspace);
       if (context) clearFormContext(context.type, context.id);
       pruneRemovedContexts(); renderedContext = null;
       if (modified) Promise.resolve(changed()).catch(error => report(error.message || '浏览器草稿保存失败，请导出结果', true));
       render(); report(message);
-    } catch (error) { workspace.graph = previous; report(error.message || '修改未保存，请检查字段', true); }
+      if (['fact', 'mention', 'entity'].includes(context?.type)) onFactSaved?.(context.type === 'fact' ? selected.fact : undefined);
+      return true;
+    } catch (error) { workspace.graph = previous.graph; workspace.records = previous.records; workspace.manifest = previous.manifest; report(error.message || '修改未保存，请检查字段', true); return false; }
   }
   function markDependents(type, id) {
     const queue = [[type, id]], seen = new Set();
@@ -397,6 +401,19 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
       const entry = { id: mention?.id || crypto.randomUUID(), description: value('g-mention-description').trim(), entity_id: value('g-mention-entity'), evidence_id: value('g-mention-evidence') };
       if (mention && nodeSignature(mention) !== nodeSignature(entry)) for (const fact of graph().facts.filter(fact => fact.subject_ids.includes(mention.entity_id) || fact.subject_ids.includes(entry.entity_id) || fact.speaker_id === mention.entity_id || fact.speaker_id === entry.entity_id)) { fact.review_status = 'needs_review'; markDependents('fact', fact.id); }
       upsert('mention', entry);
+      if (mention && mention.evidence_id !== entry.evidence_id && !graph().mentions.some(current => current.evidence_id === mention.evidence_id && current.entity_id === mention.entity_id)) {
+        const previousSource = find('evidence', mention.evidence_id);
+        const previousAnnotation = previousSource && ws().records[previousSource.item_id]?.segments.find(segment => segment.id === previousSource.segment_id)?.annotations;
+        if (previousAnnotation && Object.hasOwn(previousAnnotation, 'subject_ids')) setEvidenceSubjects(ws(), previousSource.item_id, previousSource.segment_id, previousAnnotation.subject_ids.filter(id => id !== mention.entity_id));
+      }
+      const evidence = find('evidence', entry.evidence_id);
+      const annotation = evidence && ws().records[evidence.item_id]?.segments.find(segment => segment.id === evidence.segment_id)?.annotations;
+      if (annotation && Object.hasOwn(annotation, 'subject_ids')) {
+        const ids = mention && mention.evidence_id === entry.evidence_id && mention.entity_id !== entry.entity_id
+          ? annotation.subject_ids.map(id => id === mention.entity_id ? entry.entity_id : id)
+          : [...annotation.subject_ids, entry.entity_id];
+        setEvidenceSubjects(ws(), evidence.item_id, evidence.segment_id, [...new Set(ids)]);
+      }
     }, '主体提及已保存', { type: 'mention', id: mention?.id || '' })));
     if (mention) mentionActions.append(button('取消编辑', () => { selected.mention = ''; render(); })); mentions.append(mentionActions);
     const mentionList = node('div', 'g-compact-list');
@@ -465,6 +482,11 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
       if (fact && (nodeSignature(fact) !== nodeSignature(entry) || !sameMembers(refs, evidenceIDs))) markDependents('fact', id);
       upsert('fact', entry);
       replaceLinks('fact', id, 'evidence', evidenceIDs, 'supports'); factSeed = null;
+      for (const [itemID, record] of Object.entries(ws().records)) for (const segment of record.segments) {
+        if (segment.annotations.fact_id !== id) continue;
+        if (evidenceIDs.includes(JSON.stringify([itemID, segment.id]))) segment.annotations.observation = text;
+        else delete segment.annotations.fact_id;
+      }
     }, '事实已保存，引用关系可在关联图谱中查看'));
     partitionForm(form, 'fact', ['g-fact-kind', 'g-fact-subjects', 'g-fact-speaker', 'g-fact-review']);
     layout.prepend(form); return layout;
@@ -823,7 +845,7 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
     const editor = document.querySelector('.editor-grid'), footer = document.querySelector('.task-footer');
     if (editor) editor.hidden = activeStage !== 'evidence'; if (footer) footer.hidden = activeStage !== 'evidence';
     body.replaceChildren();
-    if (activeStage === 'evidence') body.append(node('p', 'g-stage-hint', '先在下方建立证据时间窗，再把一个或多个窗口整理成独立事实。'));
+    if (activeStage === 'evidence') body.append(node('p', 'g-stage-hint', '在下方标记时间窗、选择主体并填写事实描述；保存后直接建立证据与事实的关联。事实汇总可继续整理多模态依据。'));
     if (activeStage === 'evidence') body.append(management());
     if (activeStage === 'facts') body.append(factsPanel());
     else if (activeStage === 'events') body.append(eventsPanel());

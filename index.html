@@ -11,6 +11,7 @@
   <link rel="icon" href="./favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="./styles.css">
   <link rel="stylesheet" href="./graph-ui.css">
+  <link rel="stylesheet" href="./evidence-editor.css">
   <script type="module" src="./app.mjs"></script>
 </head>
 <body>
@@ -54,11 +55,11 @@
             <div class="marker-bar"><label>起点 / 秒<input id="segment-start" type="number" min="0" step="0.001" placeholder="0.000"></label><label>终点 / 秒<input id="segment-end" type="number" min="0" step="0.001" placeholder="0.000"></label><button id="add-segment" class="primary small">新建时间窗</button><button id="delete-segment" class="danger-button" disabled>删除选中时间窗</button></div>
             <p id="time-edit-hint" class="time-edit-hint" role="status">拖动时间轴，或填写起止时间后新建。修改选中时间窗的数字会自动保存。</p>
             <section class="annotation-panel" aria-label="选中时间窗的类别与标注内容">
-              <div class="detail-top"><h3>证据观察与事实草稿</h3><p>选择证据窗，填写观察，再整理为独立事实。</p><button id="build-fact" class="secondary small">整理为事实 →</button></div>
-              <div id="detail-empty" class="detail-empty">先创建或选择时间窗，再填写归属类别和局部事实。</div>
+              <div class="detail-top"><div><h3>证据与事实</h3><p>选定时间窗和主体，直接描述可观察的事实。</p></div><button id="build-fact" class="primary small">保存证据与事实</button></div>
+              <div id="detail-empty" class="detail-empty">先创建或选择时间窗，再选择主体并填写事实描述。</div>
               <div id="segment-detail" hidden>
-                <div class="category-column"><div class="detail-summary"><span id="detail-label"></span><span id="detail-time"></span></div><label>归属类别<select id="segment-category"></select></label><label>主体 ID<input id="subject-id" maxlength="500" placeholder="未知请填 unknown"></label><label>证据用途<select id="evidence-role"><option value="">请选择用途</option><option value="event_support">事件支持</option><option value="emotion_observation">情绪观察</option><option value="both">两者兼有</option><option value="uncertain">暂不确定</option></select></label></div>
-                <div class="content-column"><label>局部事实<textarea id="local-fact" rows="4" maxlength="20000" placeholder="记录这个时间窗内能够确认的局部事实。"></textarea></label><label>观察内容<textarea id="observation" rows="3" maxlength="20000" placeholder="补充看到或听到的依据；人物声称需注明说话人。"></textarea></label><p>局部事实与观察内容至少填写一项。每个时间窗单独保存。</p></div>
+                <div class="category-column"><div class="detail-summary"><span id="detail-label"></span><span id="detail-time"></span></div><label>证据类型<select id="segment-category"></select></label><section class="evidence-subject-field" aria-labelledby="evidence-subject-label"><div class="evidence-subject-heading"><span id="evidence-subject-label">主体（可多选）</span><span id="evidence-subject-count"></span></div><div id="evidence-subjects"></div><div class="evidence-new-subject"><label class="sr-only" for="evidence-new-subject-name">新主体名称</label><input id="evidence-new-subject-name" maxlength="500" placeholder="输入新主体名称" autocomplete="off"><button id="evidence-add-subject" class="secondary small" type="button">新建并选中</button></div></section><label>后续用途提示<select id="evidence-role"><option value="">请选择用途</option><option value="event_support">事件支持</option><option value="emotion_observation">情绪观察</option><option value="both">两者兼有</option><option value="uncertain">暂不确定</option></select></label></div>
+                <div class="content-column"><label>事实描述<textarea id="observation" rows="5" maxlength="20000" placeholder="用第三人称描述这个时间窗内可观察的动作、言语或状态；情感解释在后续标注。"></textarea></label><div class="evidence-fact-options"><label>事实类型<select id="evidence-fact-kind"><option value="observation">观察事实</option><option value="reported_speech">人物陈述 / 转述事实</option></select></label><label>复核状态<select id="evidence-fact-review"><option value="needs_review">待复核</option><option value="draft">草稿</option><option value="confirmed">已人工确认</option></select></label></div><label id="evidence-fact-speaker-field" hidden>发言者<select id="evidence-fact-speaker"></select></label><p id="evidence-fact-status" role="status"></p><p class="evidence-fact-hint">这段描述直接保存为事实，并关联当前证据；无需再填一份相同内容。</p><details id="evidence-legacy-fact" hidden><summary>查看旧版局部事实</summary><p id="evidence-legacy-fact-text"></p></details></div>
               </div>
             </section>
           </section>

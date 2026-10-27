@@ -53,9 +53,10 @@ async function makeWindow(kind, start, end, text) {
   await page.locator(`#${kind}`).evaluate((media, time) => { media.currentTime = time; }, end);
   await page.keyboard.press(']'); await page.locator('#add-segment').click();
   await page.locator('#segment-category').selectOption(kind === 'video' ? 'visual_observation' : 'acoustic_observation');
-  await page.locator('#subject-id').fill('P1');
+  const existing = page.locator('#evidence-subjects label').filter({ hasText: 'P1' }).first();
+  if (await existing.count()) await existing.locator('input[type=checkbox]').check();
+  else { await page.locator('#evidence-new-subject-name').fill('P1'); await page.locator('#evidence-add-subject').click(); }
   await page.locator('#observation').fill(text);
-  await page.locator('#local-fact').fill(text);
   await page.locator('#evidence-role').selectOption('both');
 }
 async function assertNoDangling(data) {
@@ -112,7 +113,8 @@ try {
   const audio = evidenceOnly.items.find(item => item.id === 'audio_demo_1');
   const refs = [JSON.stringify([video.id, video.segments[0].id]), JSON.stringify([video.id, video.segments[1].id]),
     JSON.stringify([audio.id, audio.segments[0].id]), JSON.stringify([audio.id, audio.segments[1].id])];
-  check('four independently editable video/audio evidence windows exist before facts are created');
+  assert.equal(evidenceOnly.graph.facts.length, 4, 'completing evidence now saves its four window facts in the same workflow');
+  check('four independently editable video/audio evidence windows save their own linked facts when completed');
 
   await management();
   await page.locator('#g-entity-name').fill('合成主体 P1');
@@ -135,14 +137,21 @@ try {
     await page.waitForFunction(() => document.querySelector('.g-feedback').textContent.includes('媒体对齐已保存'));
   }
   const aligned = await downloadJSON('graph-aligned-evidence.json');
-  assert.equal(aligned.graph.entities.length, 1); assert.equal(aligned.graph.mentions.length, 4);
-  assert.equal(new Set(aligned.graph.mentions.map(mention => mention.entity_id)).size, 1);
+  assert.ok(aligned.graph.entities.some(entity => entity.id === entityID));
+  const sharedMentions = aligned.graph.mentions.filter(mention => mention.entity_id === entityID);
+  assert.equal(sharedMentions.length, 4);
+  assert.deepEqual(new Set(sharedMentions.map(mention => mention.evidence_id)), new Set(refs));
   assert.ok(aligned.items.every(item => item.timeline_id === 'scene_shared'));
   assert.equal(aligned.items.find(item => item.id === 'audio_demo_1').time_offset_s, -.1);
   check('explicit cross-modal mentions share one subject and media align on a common timeline with signed offsets');
 
   await stage('facts');
   await assertEditorLayout();
+  for (const initial of evidenceOnly.graph.facts) {
+    await page.locator(`.g-node[data-node-id="${initial.id}"]`).click();
+    await page.locator('#g-fact-review').selectOption('confirmed'); await save('保存事实', '事实已保存');
+  }
+  await page.getByRole('button', { name: '新增事实', exact: true }).click();
   await page.locator('#g-fact-text').fill('未提交的事实表单草稿');
   await page.locator('#g-fact-subjects').selectOption([entityID]);
   await page.locator('#g-fact-evidence').selectOption([refs[0]]);
@@ -176,9 +185,9 @@ try {
     factIDs.push(await page.locator('.g-node.active').getAttribute('data-node-id'));
   }
   const facts = await downloadJSON('graph-facts.json');
-  assert.equal(facts.graph.facts.length, 2);
+  assert.equal(facts.graph.facts.length, 6, 'four unified window facts remain alongside two explicit multimodal facts');
   assert.ok(facts.graph.facts.every(fact => fact.review_status === 'confirmed'));
-  assert.equal(facts.graph.links.filter(link => link.type === 'supports').length, 4);
+  assert.equal(facts.graph.links.filter(link => link.type === 'supports' && factIDs.includes(link.to_id)).length, 4);
   assert.deepEqual(facts.graph.links.filter(link => link.type === 'supports' && link.to_id === factIDs[0]).map(link => link.from_id).sort(), [refs[0], refs[2]].sort());
   check('visible reference cards support search, check/uncheck and counts while saved JSON retains exactly the selected evidence');
   check('independent confirmed facts each combine multiple video/audio evidence references');
@@ -331,7 +340,11 @@ try {
   check('graph-node deletion cleans incident edges and marks affected annotations for review');
 
   const lastWindow = structuredClone(complete); lastWindow.graph = blankGraph();
-  for (const item of lastWindow.items) { item.segments = item.id === 'video_demo_1' ? [item.segments[0]] : []; item.status = item.segments.length ? 'complete' : 'draft'; }
+  for (const item of lastWindow.items) {
+    delete item.subject_ids;
+    item.segments = item.id === 'video_demo_1' ? [item.segments[0]] : []; item.status = item.segments.length ? 'complete' : 'draft';
+    for (const segment of item.segments) { delete segment.annotations.subject_ids; delete segment.annotations.fact_id; }
+  }
   const lastWindowFile = path.join(fixtures, 'completed-single-window.json'); fs.writeFileSync(lastWindowFile, JSON.stringify(lastWindow));
   await page.locator('#result-input').setInputFiles(lastWindowFile);
   await stage('evidence');
@@ -347,7 +360,12 @@ try {
   check('deleting the last window of a completed material returns it to a valid exportable draft');
 
   const legacy = structuredClone(complete); legacy.schema_version = '1.0'; delete legacy.graph;
-  for (const item of legacy.items) for (const segment of item.segments) segment.annotations.subject_id = 'unknown';
+  for (const item of legacy.items) {
+    delete item.subject_ids;
+    for (const segment of item.segments) {
+      segment.annotations.subject_id = 'unknown'; delete segment.annotations.subject_ids; delete segment.annotations.fact_id;
+    }
+  }
   const legacyFile = path.join(fixtures, 'legacy-v1.json'); fs.writeFileSync(legacyFile, JSON.stringify(legacy));
   await page.locator('#result-input').setInputFiles(legacyFile);
   await page.waitForFunction(() => document.querySelector('.g-status').textContent === '四层待完成');

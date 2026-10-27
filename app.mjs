@@ -3,6 +3,7 @@ import { LABELS, MAX_JSON_BYTES, MAX_ITEMS, MAX_SEGMENTS, MEDIA_RE, blankRecord,
 import { listWorkspaces, removeWorkspace, storeWorkspace } from './storage.mjs';
 import { evidenceKey, invalidateEvidence, removeEvidence, migrateLegacyGraph } from './graph.mjs';
 import { mountGraphWorkbench } from './graph-ui.mjs';
+import { mountEvidenceEditor } from './evidence-editor.mjs';
 
 const $ = id => document.getElementById(id);
 const SETTINGS_KEY = `bench-settings-v1:${new URL('.', location.href).pathname}`;
@@ -28,6 +29,7 @@ let busy = false;
 let frameEdit = null;
 let frameSeek = 0;
 let graphWorkbench;
+let evidenceEditor;
 const item = () => ws?.manifest.items[ws.index];
 const record = () => ws?.records[item()?.id];
 const segment = () => record()?.segments.find(s => s.id === selected);
@@ -151,7 +153,7 @@ function renderSegments() {
     b.style.setProperty('--category-tint', `${label.color}18`);
     const info = el('span'); const main = el('span', 'segment-main'); const dot = el('span', 'label-dot'); dot.style.backgroundColor = label.color;
     main.append(dot, el('span', '', label.name)); info.append(main);
-    if (seg.annotations.local_fact || seg.annotations.observation) info.append(el('div', 'segment-note', seg.annotations.local_fact || seg.annotations.observation));
+    if (seg.annotations.observation || seg.annotations.local_fact) info.append(el('div', 'segment-note', seg.annotations.observation || seg.annotations.local_fact));
     b.setAttribute('aria-pressed', String(selected === seg.id));
     b.append(info, el('span', 'segment-times', `${displayTime(seg.start_time)} → ${displayTime(seg.end_time)}`));
     b.addEventListener('click', () => selectSegment(seg.id)); fragment.append(b);
@@ -171,7 +173,8 @@ function renderDetail() {
   }));
   category.value = seg.label;
   $('detail-time').textContent = `${displayTime(seg.start_time)} → ${displayTime(seg.end_time)}`;
-  for (const [id, key] of [['subject-id', 'subject_id'], ['local-fact', 'local_fact'], ['observation', 'observation'], ['evidence-role', 'evidence_role']]) $(id).value = seg.annotations[key] || '';
+  $('evidence-role').value = seg.annotations.evidence_role || '';
+  evidenceEditor?.render();
 }
 function selectSegment(id) {
   selected = id; const seg = segment(); if (!seg) return;
@@ -419,6 +422,7 @@ async function completeItem() {
   if (!attached.has(item().id) || !loaded) throw new Error('请先关联并确认这条任务的本地素材');
   const errors = completionErrors(item(), record());
   if (errors.length) throw new Error(errors.slice(0, 5).join('\n'));
+  evidenceEditor.saveAll(item().id);
   record().status = 'complete'; changed(false); renderProgress(); await enqueueDraft();
   if (ws.index < ws.manifest.items.length - 1) await switchItem(ws.index + 1);
   else notify('本次任务已标记完成。请导出本地结果文件，再提交到飞书');
@@ -485,7 +489,7 @@ for (const [id, fn] of [['manifest-input', files => importManifest(files[0])], [
 for (const [id, key] of [['batch-id', 'batch_id'], ['assignment-id', 'assignment_id'], ['annotator-id', 'annotator_id']]) {
   $(id).addEventListener('input', run(() => { if (ws) { ws.manifest[key] = identifier($(id).value, key); changed(false); } }));
 }
-for (const [id, key] of [['subject-id', 'subject_id'], ['local-fact', 'local_fact'], ['observation', 'observation'], ['evidence-role', 'evidence_role']]) {
+for (const [id, key] of [['evidence-role', 'evidence_role']]) {
   const update = () => { if (segment() && segment().annotations[key] !== $(id).value) { segment().annotations[key] = $(id).value; changed(); renderSegments(); } };
   $(id).addEventListener('input', update);
   $(id).addEventListener('change', () => { update(); enqueueDraft(); });
@@ -645,7 +649,7 @@ document.addEventListener('keydown', e => {
   else { const label = LABELS.find(x => x.key === e.key); if (label) { e.preventDefault(); chooseLabel(label.id); } }
 });
 window.addEventListener('beforeunload', e => {
-  if (graphWorkbench?.hasUnsavedChanges?.() || (ws && ws.revision !== ws.exported_revision && ws.revision > 0)) { e.preventDefault(); e.returnValue = ''; }
+  if (graphWorkbench?.hasUnsavedChanges?.() || evidenceEditor?.hasUnsavedChanges?.() || (ws && ws.revision !== ws.exported_revision && ws.revision > 0)) { e.preventDefault(); e.returnValue = ''; }
 });
 window.addEventListener('pagehide', () => { enqueueDraft(); });
 
@@ -660,9 +664,14 @@ function validateDraft(saved) {
   if (saved._storage_token) clean._storage_token = identifier(saved._storage_token, '草稿版本令牌');
   return clean;
 }
+evidenceEditor = mountEvidenceEditor({
+  getWorkspace: () => ws, getItem: item, getSegment: segment,
+  changed, persist: enqueueDraft, notify, onSaved: renderSegments
+});
 graphWorkbench = mountGraphWorkbench($('graph-workbench'), {
   getWorkspace: () => ws,
   changed: async () => { if (ws) { changed(false); await enqueueDraft(); } },
+  onFactSaved: factID => { if (factID && segment()?.annotations.fact_id === factID) evidenceEditor.resetCurrent(); renderDetail(); renderSegments(); },
   navigateEvidence: async (itemID, segmentID) => {
     if (!ws) return;
     const index = ws.manifest.items.findIndex(task => task.id === itemID);
@@ -672,19 +681,11 @@ graphWorkbench = mountGraphWorkbench($('graph-workbench'), {
     requestAnimationFrame(() => document.querySelector('.media-stage').scrollIntoView({ block: 'center', behavior: 'smooth' }));
   }
 });
-$('local-fact').closest('label').firstChild.textContent = '待整理事实（可选）';
-$('observation').closest('label').firstChild.textContent = '证据观察';
 $('segment-category').closest('label').firstChild.textContent = '证据类型';
-$('subject-id').closest('label').firstChild.textContent = '主体';
-$('subject-id').placeholder = '在此标注主体，后续卡片沿用；未知填 unknown';
 $('evidence-role').closest('label').firstChild.textContent = '后续用途提示';
 $('progress').setAttribute('aria-label', '素材证据标记进度');
 document.querySelector('.brand-sub').textContent = '多模态四层标注工作台';
-document.querySelector('.annotation-panel .content-column p').textContent = '这里的文字保存在证据窗内；点击“整理为事实”后沿用证据主体，无需重复建立主体。核对描述与依据后保存独立事实。';
 $('complete-item').textContent = '证据标记完成并继续';
-$('build-fact').addEventListener('click', () => {
-  if (!segment()) return notify('请先选择一个证据时间窗', true);
-  graphWorkbench.openFactFromEvidence(evidenceKey(item().id, selected));
-});
+$('build-fact').addEventListener('click', run(() => evidenceEditor.saveCurrent()));
 // Start empty. Existing drafts stay in IndexedDB until explicitly restored.
 if ('serviceWorker' in navigator && window.isSecureContext) navigator.serviceWorker.register('./sw.js').catch(() => {});

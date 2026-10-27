@@ -168,6 +168,26 @@ export function normalizeGraph(raw, ws) {
     if (relationships.has(signature)) throw new Error('图谱关联重复');
     relationships.add(signature);
   }
+  const supportingPairs = new Set(graph.links.filter(link => link.from_type === 'evidence' && link.to_type === 'fact').map(link => JSON.stringify([link.from_id, link.to_id])));
+  for (const item of ws?.manifest?.items || []) {
+    if (Object.hasOwn(item, 'subject_ids')) {
+      const ids = array(item.subject_ids, '任务主体', 100).map(value => id(value, '任务主体 ID'));
+      if (new Set(ids).size !== ids.length) throw new Error('任务主体 ID 重复');
+      ids.forEach(checkEntity);
+    }
+    for (const segment of ws?.records?.[item.id]?.segments || []) {
+      const annotation = segment.annotations || {};
+      if (Object.hasOwn(annotation, 'subject_ids')) {
+        const ids = array(annotation.subject_ids, '证据主体', 100).map(value => id(value, '证据主体 ID'));
+        if (new Set(ids).size !== ids.length) throw new Error('证据主体 ID 重复');
+        ids.forEach(checkEntity);
+      }
+      if (annotation.fact_id) {
+        const factID = id(annotation.fact_id, '证据事实 ID');
+        if (!nodeIDs.fact.has(factID) || !supportingPairs.has(JSON.stringify([evidenceKey(item.id, segment.id), factID]))) throw new Error('证据绑定了不存在或缺少支持关系的事实');
+      }
+    }
+  }
   if (graph.status === 'complete') {
     const errors = graphIssues({ ...ws, graph }).filter(issue => issue.severity === 'error');
     if (errors.length) throw new Error(`图谱尚不能标记完成：${errors.slice(0, 3).map(issue => issue.message).join('；')}`);
@@ -295,10 +315,22 @@ function invalidateNodes(ws, seeds) {
   return graph;
 }
 export function invalidateEvidence(ws, refs) { return invalidateNodes(ws, [...keys(refs)].map(key => ['evidence', key])); }
+export function invalidateFactDependents(ws, factID) {
+  const seeds = (ws.graph?.links || []).filter(link => link.from_type === 'fact' && link.from_id === factID).map(link => [link.to_type, link.to_id]);
+  return invalidateNodes(ws, seeds);
+}
+function cleanEvidenceBindings(ws, graph) {
+  const facts = new Set(graph.facts.map(fact => fact.id));
+  const supports = new Set(graph.links.filter(link => link.from_type === 'evidence' && link.to_type === 'fact').map(link => JSON.stringify([link.from_id, link.to_id])));
+  for (const item of ws?.manifest?.items || []) for (const segment of ws?.records?.[item.id]?.segments || []) {
+    if (segment.annotations?.fact_id && (!facts.has(segment.annotations.fact_id) || !supports.has(JSON.stringify([evidenceKey(item.id, segment.id), segment.annotations.fact_id])))) delete segment.annotations.fact_id;
+  }
+}
 export function removeEvidence(ws, refs) {
   const removed = keys(refs), graph = invalidateEvidence(ws, [...removed]);
   graph.mentions = graph.mentions.filter(mention => !removed.has(mention.evidence_id));
   graph.links = graph.links.filter(link => link.from_type !== 'evidence' || !removed.has(link.from_id));
+  cleanEvidenceBindings(ws, graph);
   return graph;
 }
 export function removeGraphNode(ws, collection, nodeID) {
@@ -310,6 +342,12 @@ export function removeGraphNode(ws, collection, nodeID) {
   if (name === 'links') seeds.push([node.to_type, node.to_id]);
   if (name === 'mentions' && node.entity_id) for (const fact of graph.facts) if (fact.subject_ids.includes(node.entity_id) || fact.speaker_id === node.entity_id) seeds.push(['fact', fact.id]);
   if (name === 'entities') {
+    for (const item of ws?.manifest?.items || []) if (item.subject_ids) item.subject_ids = item.subject_ids.filter(key => key !== nodeID);
+    for (const record of Object.values(ws.records || {})) for (const segment of record.segments || []) if (segment.annotations?.subject_ids?.includes(nodeID)) {
+      segment.annotations.subject_ids = segment.annotations.subject_ids.filter(key => key !== nodeID);
+      segment.annotations.subject_id = segment.annotations.subject_ids[0] || '';
+      record.status = 'draft';
+    }
     graph.mentions = graph.mentions.filter(mention => mention.entity_id !== nodeID);
     for (const fact of graph.facts) if (fact.subject_ids.includes(nodeID) || fact.speaker_id === nodeID) {
       fact.subject_ids = fact.subject_ids.filter(key => key !== nodeID); if (fact.speaker_id === nodeID) fact.speaker_id = ''; seeds.push(['fact', fact.id]);
@@ -323,8 +361,17 @@ export function removeGraphNode(ws, collection, nodeID) {
   if (name === 'emotion_transitions') for (const key of [node.from_state_id, node.to_state_id]) if (key) seeds.push(['emotion_state', key]);
   invalidateNodes(ws, seeds);
   graph[name] = graph[name].filter(value => value.id !== nodeID);
+  if (name === 'mentions' && !graph.mentions.some(mention => mention.entity_id === node.entity_id && mention.evidence_id === node.evidence_id)) {
+    for (const item of ws?.manifest?.items || []) for (const segment of ws?.records?.[item.id]?.segments || []) {
+      if (evidenceKey(item.id, segment.id) !== node.evidence_id || !segment.annotations?.subject_ids) continue;
+      segment.annotations.subject_ids = segment.annotations.subject_ids.filter(key => key !== node.entity_id);
+      segment.annotations.subject_id = segment.annotations.subject_ids[0] || '';
+      ws.records[item.id].status = 'draft';
+    }
+  }
   graph.emotion_transitions = graph.emotion_transitions.filter(value => !removedTransitions.has(value.id));
   graph.links = graph.links.filter(link => !(link.from_type === type && link.from_id === nodeID) && !(link.to_type === type && link.to_id === nodeID) && !(link.to_type === 'emotion_transition' && removedTransitions.has(link.to_id)));
+  cleanEvidenceBindings(ws, graph);
   return graph;
 }
 export function migrateLegacyGraph(ws) {

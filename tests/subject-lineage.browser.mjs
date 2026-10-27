@@ -76,18 +76,41 @@ async function save(name, message) {
     return feedback.textContent.includes(wanted) && !feedback.classList.contains('error');
   }, message);
 }
+async function saveEvidenceAndOpen(name) {
+  const windowID = await page.locator('.segment-row[aria-pressed="true"]').getAttribute('data-segment-id');
+  await page.locator('#build-fact').click();
+  await page.waitForFunction(() => document.getElementById('evidence-fact-status').textContent.includes('证据与事实已保存'));
+  assert.equal(await page.locator('.g-tab.active').getAttribute('data-stage'), 'evidence');
+  const data = await download(name);
+  const source = data.items.flatMap(item => item.segments).find(segment => segment.id === windowID);
+  assert.ok(source?.annotations.fact_id);
+  await stage('facts'); await page.locator(`.g-node[data-node-id="${source.annotations.fact_id}"]`).click();
+  return data;
+}
+async function replaceEvidenceSubject(name) {
+  await page.locator('#evidence-new-subject-name').fill(name); await page.locator('#evidence-add-subject').click();
+  const created = page.locator('#evidence-subjects label').filter({ hasText: name }).last().locator('input[type=checkbox]');
+  const id = await created.getAttribute('value');
+  const others = await page.locator('#evidence-subjects input[type=checkbox]:checked').evaluateAll((nodes, keep) => nodes.map(node => node.value).filter(value => value !== keep), id);
+  for (const other of others) {
+    const inputs = page.locator('#evidence-subjects input[type=checkbox]');
+    const index = await inputs.evaluateAll((nodes, target) => nodes.findIndex(node => node.value === target), other);
+    await inputs.nth(index).uncheck();
+  }
+  return id;
+}
 
 try {
   await page.goto(origin); await page.waitForSelector('#welcome:not([hidden])');
   await load(fixture());
   await stage('facts');
-  const subjectA = await expectSingle('g-fact-subjects', '主体甲');
+  let subjectA = await expectSingle('g-fact-subjects', '主体甲');
   const beforeSave = await download('before-save');
   assert.equal(beforeSave.graph.entities.length, 1, 'deriving a subject preview must not alter the stored graph');
   check('a new fact inherits only the current material evidence subject and renders one subject card without a global list');
 
-  await stage('evidence'); await page.locator('.segment-row').first().click(); await page.locator('#build-fact').click();
-  assert.equal(await expectSingle('g-fact-subjects', '主体甲'), subjectA);
+  await stage('evidence'); await page.locator('.segment-row').first().click(); await saveEvidenceAndOpen('unified-first');
+  subjectA = await expectSingle('g-fact-subjects', '主体甲');
   assert.deepEqual(await selected('g-fact-evidence'), [ev('demo_video', 'v1')]);
   await page.locator('#g-fact-text').fill('主体甲作出可观察动作。');
   await save('保存事实', '事实已保存');
@@ -96,8 +119,8 @@ try {
   assert.deepEqual(factA.subject_ids, [subjectA]);
   assert.equal(first.graph.entities.find(entry => entry.id === subjectA).name, '主体甲');
   assert.ok(first.graph.mentions.some(entry => entry.entity_id === subjectA && entry.evidence_id === ev('demo_video', 'v1')));
-  assert.equal(first.items[0].segments[0].annotations.subject_id, '主体甲');
-  check('organizing evidence into a fact reuses its subject identity and commits an explicit evidence mention without changing the source annotation');
+  assert.deepEqual(first.items[0].segments[0].annotations.subject_ids, [subjectA]);
+  check('saving evidence and its fact reuses one canonical subject identity and commits an explicit evidence mention');
 
   await stage('events'); await choose('g-event-facts', factA.id);
   assert.equal(await expectSingle('g-event-subjects', '主体甲'), subjectA);
@@ -166,7 +189,7 @@ try {
 
   const known = fixture(); known.graph.entities.push({ id: 'mapped', name: '人工共指主体', aliases: [] });
   known.graph.mentions.push({ id: 'mapped_mention', entity_id: 'mapped', evidence_id: ev('demo_video', 'v1'), description: '人工确认的视觉提及' });
-  await load(known); await stage('evidence'); await page.locator('.segment-row').first().click(); await page.locator('#build-fact').click();
+  await load(known); await stage('evidence'); await page.locator('.segment-row').first().click(); await saveEvidenceAndOpen('mapped-inline');
   assert.equal(await expectSingle('g-fact-subjects', '人工共指主体'), 'mapped');
   check('explicit evidence-to-subject coreference takes priority over the raw textual subject clue');
 
@@ -200,7 +223,8 @@ try {
   check('events and emotions inherit the subjects actually selected in their fact instead of reintroducing other people visible in its evidence');
 
   await load(first); await stage('evidence'); await page.locator('.segment-row').first().click();
-  await page.locator('#subject-id').fill('主体丙'); await page.locator('#build-fact').click();
+  await replaceEvidenceSubject('主体丙'); await stage('facts'); await page.getByRole('button', { name: '新增事实', exact: true }).click();
+  await choose('g-fact-evidence', ev('demo_video', 'v1'));
   const subjectC = await expectSingle('g-fact-subjects', '主体丙'); assert.notEqual(subjectC, subjectA);
   await page.locator('#g-fact-text').fill('主体丙的新事实。'); await save('保存事实', '事实已保存');
   const changedClue = await download('changed-evidence-subject');
@@ -208,12 +232,12 @@ try {
   assert.equal(changedClue.graph.facts.find(entry => entry.id === factA.id).review_status, 'needs_review');
   assert.deepEqual(changedClue.graph.facts.find(entry => entry.text === '主体丙的新事实。').subject_ids, [subjectC]);
   assert.ok(changedClue.graph.mentions.some(entry => entry.entity_id === subjectC && entry.evidence_id === ev('demo_video', 'v1')));
-  check('editing an evidence subject replaces stale automatic inheritance while preserving the old fact as an explicitly reviewable record');
+  check('changing the evidence subject updates advanced fact inheritance while retaining a historical fact for explicit review');
 
-  await load(fixture()); await stage('evidence'); await page.locator('.segment-row').first().click(); await page.locator('#build-fact').click();
+  await load(fixture()); await stage('facts'); await choose('g-fact-evidence', ev('demo_video', 'v1'));
   const originalDraftSubject = (await selected('g-fact-subjects'))[0]; assert.ok(originalDraftSubject);
   await page.locator('#g-fact-text').fill('主体变更后仍保留的自定义事实草稿。');
-  await stage('evidence'); await page.locator('.segment-row').first().click(); await page.locator('#subject-id').fill('主体丁');
+  await stage('evidence'); await page.locator('.segment-row').first().click(); await replaceEvidenceSubject('主体丁');
   await stage('facts');
   const revisedDraftSubject = await expectSingle('g-fact-subjects', '主体丁'); assert.notEqual(revisedDraftSubject, originalDraftSubject);
   assert.equal(await page.locator('#g-fact-text').inputValue(), '主体变更后仍保留的自定义事实草稿。');
@@ -225,10 +249,10 @@ try {
   check('an unsaved fact directly revisited after its evidence subject changes keeps its text and references while selecting and saving the new subject');
 
   const unknown = fixture(); unknown.items[0].segments.forEach(entry => { entry.annotations.subject_id = 'unknown'; });
-  await load(unknown); await stage('evidence'); await page.locator('.segment-row').first().click(); await page.locator('#build-fact').click();
+  await load(unknown); await stage('evidence'); await page.locator('.segment-row').first().click(); await saveEvidenceAndOpen('unknown-first');
   const firstUnknown = (await selected('g-fact-subjects'))[0]; assert.ok(firstUnknown);
   await stage('evidence'); await page.locator('.segment-row').nth(1).click();
-  page.once('dialog', dialog => dialog.accept()); await page.locator('#build-fact').click();
+  await saveEvidenceAndOpen('unknown-next');
   const nextUnknown = (await selected('g-fact-subjects'))[0]; assert.ok(nextUnknown); assert.notEqual(nextUnknown, firstUnknown);
   check('unknown evidence subjects remain separate identities across windows rather than being silently merged');
 

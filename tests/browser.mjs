@@ -71,9 +71,8 @@ try {
     await page.locator(`#${kind}`).evaluate((media, t) => { media.currentTime = t; }, end);
     await page.keyboard.press(']'); await page.locator('#add-segment').click();
     await page.locator('#segment-category').selectOption(kind === 'video' ? 'visual_observation' : 'acoustic_observation');
-    await page.locator('#subject-id').fill('unknown'); await page.locator('#observation').fill(observation);
+    await page.locator('#evidence-new-subject-name').fill('unknown'); await page.locator('#evidence-add-subject').click(); await page.locator('#observation').fill(observation);
     await page.locator('#evidence-role').selectOption('event_support');
-    await page.locator('#local-fact').fill('局部事实：' + observation);
   }
   await makeSegment('video', 1, 3, '浏览器验证：视频色块在 1–3 秒可见。');
   await page.locator('#complete-item').click();
@@ -188,7 +187,7 @@ try {
   await page.mouse.down(); await page.mouse.move(bounds.x + bounds.width * .6, bounds.y + 20, { steps: 12 }); await page.mouse.up();
   await page.waitForFunction(() => document.querySelectorAll('.segment-row').length === 1);
   assert.equal(await page.locator('#segment-category').inputValue(), 'unclassified');
-  await page.locator('#subject-id').fill('person_1');
+  await page.locator('#evidence-new-subject-name').fill('person_1'); await page.locator('#evidence-add-subject').click();
   await page.locator('#observation').fill('同一区间的独立观察');
   await page.locator('#evidence-role').selectOption('event_support');
   await page.locator('#complete-item').click();
@@ -200,12 +199,11 @@ try {
   assert.equal(await page.locator('#detail-time').textContent(), originalTime);
   assert.equal(await page.locator('#segment-category').inputValue(), 'unclassified');
   assert.equal(await page.locator('#observation').inputValue(), '');
-  assert.equal(await page.locator('#local-fact').inputValue(), '');
-  await page.locator('#subject-id').fill('person_2');
+  assert.equal(await page.locator('#local-fact').isVisible(), false);
+  await page.locator('#evidence-new-subject-name').fill('person_2'); await page.locator('#evidence-add-subject').click();
   await page.locator('#evidence-role').selectOption('event_support');
-  await page.locator('#local-fact').fill('第二时间窗的局部事实');
   await page.locator('#segment-category').selectOption('speech_content');
-  await page.locator('#observation').fill('副本的言语内容');
+  await page.locator('#observation').fill('第二时间窗的局部事实');
   await page.locator('.segment-row').first().click();
   assert.equal(await page.locator('#segment-category').inputValue(), 'visual_observation');
   assert.equal(await page.locator('#observation').inputValue(), '同一区间的独立观察');
@@ -216,7 +214,7 @@ try {
   assert.notEqual(frames[0].id, frames[1].id); assert.equal(frames[0].start_time, frames[1].start_time);
   assert.equal(frames[0].end_time, frames[1].end_time);
   assert.deepEqual(frames.map(s => s.label), ['visual_observation', 'speech_content']);
-  assert.equal(frames[1].annotations.local_fact, '第二时间窗的局部事实');
+  assert.equal(frames[1].annotations.observation, '第二时间窗的局部事实');
   check('drag/create -> vertical category-colored list -> independent empty window -> export preserves overlapping windows');
 
   const readTimes = async () => ({ start: Number(await page.locator('#segment-start').inputValue()), end: Number(await page.locator('#segment-end').inputValue()) });
@@ -279,10 +277,10 @@ try {
   await page.locator('#segment-end').fill('3'); await page.locator('#segment-end').press('Tab');
   assert.equal(await page.locator('.segment-row').count(), 2);
   assert.deepEqual(await readTimes(), { start: 1, end: 3 });
-  await page.locator('#local-fact').fill('时间修改后保留的局部事实');
+  await page.locator('#observation').fill('时间修改后保留的局部事实');
   await page.locator('#add-segment').click();
   assert.equal(await page.locator('.segment-row').count(), 3);
-  assert.equal(await page.locator('#local-fact').inputValue(), '');
+  assert.equal(await page.locator('#local-fact').isVisible(), false);
   assert.equal(await page.locator('#observation').inputValue(), '');
   page.once('dialog', dialog => dialog.dismiss()); await page.locator('#delete-segment').click();
   assert.equal(await page.locator('.segment-row').count(), 3);
@@ -291,7 +289,7 @@ try {
   assert.equal(await page.locator('#delete-segment').isDisabled(), true);
   await page.locator('.segment-row').first().click();
   assert.deepEqual(await readTimes(), { start: 1, end: 3 });
-  assert.equal(await page.locator('#local-fact').inputValue(), '时间修改后保留的局部事实');
+  assert.equal(await page.locator('#observation').inputValue(), '时间修改后保留的局部事实');
   check('simplified controls, automatic numeric time edits, category colors, horizontal annotation columns and selected-window deletion');
 
   await page.locator('#settings-button').click();
@@ -307,7 +305,7 @@ try {
   await page.waitForFunction(() => document.getElementById('video').readyState >= 2);
   await page.locator('.segment-row').first().click();
   assert.deepEqual(await readTimes(), { start: 1, end: 3 });
-  assert.equal(await page.locator('#local-fact').inputValue(), '时间修改后保留的局部事实');
+  assert.equal(await page.locator('#observation').inputValue(), '时间修改后保留的局部事实');
   assert.equal(await page.locator('.media-stage').evaluate(e => e.getBoundingClientRect().height), 420);
   assert.equal(await page.locator('#video').evaluate(v => v.playbackRate), 1.5);
   assert.equal(await page.locator('#playback-rate').inputValue(), '1.5');
@@ -322,7 +320,7 @@ try {
   await page.locator('#previous-item').click();
   await page.waitForFunction(() => document.getElementById('video').readyState >= 2);
   await page.locator('.segment-row').last().click();
-  assert.equal(await page.locator('#local-fact').inputValue(), '第二时间窗的局部事实');
+  assert.equal(await page.locator('#observation').inputValue(), '第二时间窗的局部事实');
   await page.locator('#settings-button').click();
   await page.locator('#reset-settings').click(); await page.locator('#save-settings').click();
   await page.screenshot({ path: path.join(artifacts, 'local-frame-workspace.png'), fullPage: true });
@@ -358,7 +356,7 @@ try {
   const audioExport = mp3Export.items.find(i => i.id === 'tone.mp3');
   assert.equal(audioExport.media_type, 'audio'); assert.equal(audioExport.status, 'complete');
   assert.equal(audioExport.segments[0].start_time, .5); assert.equal(audioExport.segments[0].end_time, 2);
-  assert.equal(mp3Export.items.find(i => i.id === 'video_demo_1').segments[0].annotations.local_fact, '时间修改后保留的局部事实');
+  assert.equal(mp3Export.items.find(i => i.id === 'video_demo_1').segments[0].annotations.observation, '时间修改后保留的局部事实');
   await page.reload(); await restoreLatest(); await page.waitForSelector('#workspace:not([hidden])');
   await page.locator('#attach-input').setInputFiles(mp3Path);
   await page.waitForFunction(() => document.getElementById('audio').readyState >= 2);
@@ -426,7 +424,7 @@ try {
   await page.locator('.timeline-segment').first().click();
   const taskScroll = await page.locator('#task-list').evaluate(node => node.scrollTop);
   const windowScroll = await page.locator('#segment-list').evaluate(node => node.scrollTop);
-  await page.locator('#local-fact').fill('Editing keeps both queue scroll positions');
+  await page.locator('#observation').fill('Editing keeps both queue scroll positions');
   assert.equal(await page.locator('#task-list').evaluate(node => node.scrollTop), taskScroll);
   assert.equal(await page.locator('#segment-list').evaluate(node => node.scrollTop), windowScroll);
   await page.screenshot({ path: path.join(artifacts, 'queue-scroll-workspace.png'), fullPage: true });

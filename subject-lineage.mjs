@@ -14,7 +14,7 @@ export function createSubjectResolver(ws) {
     const evidence = new Map(), mentions = new Map(), sameClue = new Map(), staleAutoMentions = new Set(), manualMentions = new Map();
     for (const item of ws.manifest?.items || []) for (const segment of ws.records?.[item.id]?.segments || []) {
       const id = evidenceKey(item.id, segment.id), raw = String(segment.annotations?.subject_id || '').trim();
-      evidence.set(id, { id, item_id: item.id, raw });
+      evidence.set(id, { id, item_id: item.id, raw, canonical: Object.hasOwn(segment.annotations || {}, 'subject_ids') ? segment.annotations.subject_ids : null });
     }
     for (const mention of current.mentions) {
       if (!evidence.has(mention.evidence_id) || !entities.has(mention.entity_id) || mention.description?.startsWith(AUTO_MENTION_PREFIX)) continue;
@@ -26,12 +26,13 @@ export function createSubjectResolver(ws) {
       if (!source || !entities.has(mention.entity_id)) continue;
       if (mention.description?.startsWith(AUTO_MENTION_PREFIX)) {
         const manual = manualMentions.get(source.id);
-        if (mention.description !== AUTO_MENTION_PREFIX + source.raw || manual && !manual.has(mention.entity_id)) staleAutoMentions.add(mention.id);
+        if (source.canonical ? !source.canonical.includes(mention.entity_id) : mention.description !== AUTO_MENTION_PREFIX + source.raw || manual && !manual.has(mention.entity_id)) staleAutoMentions.add(mention.id);
         if (staleAutoMentions.has(mention.id) || manual) continue;
       }
       if (!mentions.has(source.id)) mentions.set(source.id, new Set());
       mentions.get(source.id).add(mention.entity_id);
       if (!source.raw || unknown(source.raw)) continue;
+      if (source.canonical !== null && mention.description?.startsWith(AUTO_MENTION_PREFIX) && mention.description !== AUTO_MENTION_PREFIX + source.raw) continue;
       const key = identity(source.item_id, source.raw, source.id);
       if (!sameClue.has(key)) sameClue.set(key, new Set());
       sameClue.get(key).add(mention.entity_id);
@@ -62,6 +63,10 @@ export function createSubjectResolver(ws) {
     const candidates = [];
     for (const id of new Set(list(evidenceIDs))) {
       const source = state.evidence.get(id); if (!source) continue;
+      if (source.canonical !== null) {
+        for (const subjectID of source.canonical) { const entity = state.entities.get(subjectID); if (entity) candidates.push(existing(entity, [id])); }
+        continue;
+      }
       const explicit = state.mentions.get(id);
       if (explicit?.size) {
         for (const entityID of explicit) candidates.push(existing(state.entities.get(entityID), [id]));

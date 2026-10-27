@@ -14,6 +14,12 @@ export const LABELS = [
 export const ROLES = ['event_support', 'emotion_observation', 'both', 'uncertain'];
 export const MEDIA_RE = /\.(mp4|webm|mov|m4v|wav|mp3|ogg|oga|flac|m4a|aac|opus|weba)$/i;
 const VIDEO_RE = /\.(mp4|webm|mov|m4v)$/i;
+function canonicalSubjects(value, name) {
+  if (!Array.isArray(value) || value.length > 100) throw new Error(`${name}必须是最多 100 项的列表`);
+  const result = value.map(value => { const id = identifier(value, `${name} ID`); if (!id) throw new Error(`${name} ID 不能为空`); return id; });
+  if (new Set(result).size !== result.length) throw new Error(`${name} ID 重复`);
+  return result;
+}
 
 export function text(value, name, max = 20000, fallback = '') {
   if (value === undefined || value === null) return fallback;
@@ -63,7 +69,7 @@ function cleanItem(raw, index) {
     })(),
     clip_start_s: finite(raw.clip_start_s, '原片起始秒'),
     duration_s: finite(raw.duration_s ?? raw.media?.duration_s, '素材时长', null),
-    video_fps: fps, text: text(raw.text, '任务说明'),
+    video_fps: fps, text: text(raw.text, '任务说明'), ...(Object.hasOwn(raw, 'subject_ids') ? { subject_ids: canonicalSubjects(raw.subject_ids, '任务主体') } : {}),
   };
 }
 export function parseManifest(input) {
@@ -96,9 +102,14 @@ export function cleanSegment(raw, item) {
   const a = raw.annotations ?? {};
   const role = text(a.evidence_role, '证据用途', 50);
   if (role && !ROLES.includes(role)) throw new Error('证据用途不受支持');
+  const additions = {};
+  if (Object.hasOwn(a, 'subject_ids')) {
+    additions.subject_ids = canonicalSubjects(a.subject_ids, '证据主体');
+  }
+  if (Object.hasOwn(a, 'fact_id')) additions.fact_id = identifier(a.fact_id, '证据事实 ID');
   return { id: identifier(raw.id, '片段 ID') || crypto.randomUUID(), start_time: start, end_time: end, label: raw.label,
     annotations: { subject_id: text(a.subject_id, '主体 ID', 500), observation: text(a.observation, '观察内容'), local_fact: text(a.local_fact, '局部事实'),
-      evidence_role: role, uncertainty: text(a.uncertainty, '不确定性', 5000) } };
+      evidence_role: role, uncertainty: text(a.uncertainty, '不确定性', 5000), ...additions } };
 }
 export function editInterval(segment, delta, mode, duration) {
   if (!Number.isFinite(delta) || !Number.isFinite(duration) || duration <= 0) throw new Error('无效的时间轴位置');
@@ -120,7 +131,7 @@ export function completionErrors(item, record) {
   for (const [i, seg] of record.segments.entries()) {
     if (seg.label === 'unclassified') errors.push(`片段 ${i + 1}：请选择归属类别`);
     try { cleanSegment(seg, item); } catch (e) { errors.push(`片段 ${i + 1}：${e.message}`); }
-    if (!seg.annotations.subject_id.trim()) errors.push(`片段 ${i + 1}：填写主体 ID，未知可填 unknown`);
+    if (Object.hasOwn(seg.annotations, 'subject_ids') ? !seg.annotations.subject_ids?.length : !(seg.annotations.subject_id || '').trim()) errors.push(`片段 ${i + 1}：请选择主体或新建主体`);
     if (!(seg.annotations.local_fact || '').trim() && !(seg.annotations.observation || '').trim()) errors.push(`片段 ${i + 1}：填写局部事实或观察内容`);
     if (!seg.annotations.evidence_role) errors.push(`片段 ${i + 1}：选择证据用途`);
   }

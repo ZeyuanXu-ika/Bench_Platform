@@ -8,7 +8,7 @@ from urllib.parse import unquote, urlsplit
 from urllib.request import urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
-PUBLIC = {"/", "/index.html", "/styles.css", "/graph-ui.css", "/app.mjs", "/core.mjs", "/graph.mjs", "/graph-view.mjs", "/subject-lineage.mjs", "/graph-ui.mjs", "/storage.mjs", "/sw.js", "/favicon.svg", "/README.md", "/samples/demo-task.zip", "/samples/demo-graph.json"}
+PUBLIC = {"/", "/index.html", "/styles.css", "/graph-ui.css", "/evidence-editor.css", "/app.mjs", "/core.mjs", "/graph.mjs", "/graph-view.mjs", "/subject-lineage.mjs", "/evidence-fact.mjs", "/evidence-editor.mjs", "/graph-ui.mjs", "/storage.mjs", "/sw.js", "/favicon.svg", "/README.md", "/samples/demo-task.zip", "/samples/demo-graph.json"}
 
 
 class Handler(SimpleHTTPRequestHandler):
