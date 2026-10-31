@@ -1,4 +1,4 @@
-import { blankGraph, evidenceKey, MAX_GRAPH_NODES } from './graph.mjs';
+import { blankGraph, evidenceKey, MAX_GRAPH_NODES, nextAnnotationId } from './graph.mjs';
 
 // Subject choices follow saved evidence and relations. Derivation never writes a draft.
 const unknown = value => /^(unknown|未知|未知主体|不明|待确认)$/i.test(value);
@@ -42,9 +42,8 @@ export function createSubjectResolver(ws) {
     for (const candidate of planned.values()) used.add(candidate.id);
     return { current, entities, evidence, mentions, sameClue, staleAutoMentions, occupied, used };
   }
-  function freshID(used) {
-    let id;
-    do { id = crypto.randomUUID(); } while (used.has(id));
+  function freshID(used, type = 'entity') {
+    const id = nextAnnotationId(ws, type, used);
     used.add(id); return id;
   }
   function merge(candidates) {
@@ -131,7 +130,7 @@ export function createSubjectResolver(ws) {
         if (!current.some(entry => entry.id === candidate.id)) throw new Error('证据主体已变化，请重新选择依据');
         if (state.current.mentions.some(entry => !removed.has(entry.id) && entry.entity_id === candidate.id && entry.evidence_id === evidenceID)) continue;
         const source = state.evidence.get(evidenceID);
-        mentions.push({ id: freshID(state.used), entity_id: candidate.id, evidence_id: evidenceID, description: AUTO_MENTION_PREFIX + (source.raw || candidate.name) });
+        mentions.push({ id: freshID(state.used, 'mention'), entity_id: candidate.id, evidence_id: evidenceID, description: AUTO_MENTION_PREFIX + (source.raw || candidate.name) });
       }
     }
     const count = ['entities', 'mentions', 'facts', 'events', 'emotion_states', 'emotion_transitions'].reduce((sum, collection) => sum + state.current[collection].length, 0);

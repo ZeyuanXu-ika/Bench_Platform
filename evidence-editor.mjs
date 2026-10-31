@@ -1,5 +1,6 @@
 import { evidenceKey, MAX_GRAPH_NODES } from './graph.mjs';
 import { createSubjectResolver } from './subject-lineage.mjs';
+import { nextAnnotationId } from './graph.mjs';
 import { getEvidenceFact, saveEvidenceFact, setEvidenceSubjects } from './evidence-fact.mjs';
 
 const node = (tag, className, text) => { const element = document.createElement(tag); if (className) element.className = className; if (text !== undefined) element.textContent = text; return element; };
@@ -7,12 +8,19 @@ const sameIDs = (left, right) => left.length === right.length && [...left].sort(
 const reviews = new Set(['draft', 'needs_review', 'confirmed']);
 
 // The media player stays mounted. This controller updates only the selected evidence form.
-export function mountEvidenceEditor({ getWorkspace, getItem, getSegment, changed, persist, notify, onSaved }) {
+export function mountEvidenceEditor({ getWorkspace, getItem, getSegment, changed, persist, notify, onSaved, validateSave }) {
   const $ = id => document.getElementById(id), drafts = new Map(), inventories = new Map();
   let resolverWorkspace = null, resolver = null, renderedKey = '';
+  let autoTimer=null;
+  function scheduleAuto(){clearTimeout(autoTimer);const current=workspace(),item=getItem(),segment=getSegment();if(!current||!item||!segment)return;const itemID=item.id,segmentID=segment.id;
+    autoTimer=setTimeout(async()=>{if(workspace()!==current)return;const target=current.records[itemID]?.segments.find(s=>s.id===segmentID);if(!target)return;const before=snapshot(current);
+      try{if(target.annotations.observation?.trim() && selectedIDs(itemID,segmentID).length){const result=saveOne(itemID,segmentID);if(result.modified)changed(false);}await persist();if(isCurrent(current,itemID,segmentID))report('已自动保存');}
+      catch(error){restore(current,before);await persist();if(isCurrent(current,itemID,segmentID))report(error.code==='TEMPORAL_ORDER'?error.message:'已保留草稿',error.code==='TEMPORAL_ORDER'?'error':'pending');}
+    },650);
+  }
   function workspace() {
     const ws = getWorkspace();
-    if (ws && ws !== resolverWorkspace) { resolverWorkspace = ws; resolver = createSubjectResolver(ws); }
+    if (ws && ws !== resolverWorkspace) { drafts.clear();inventories.clear();renderedKey='';resolverWorkspace = ws; resolver = createSubjectResolver(ws); }
     return ws;
   }
   const key = (itemID, segmentID) => JSON.stringify([workspace()?.id, itemID, segmentID]);
@@ -28,10 +36,11 @@ export function mountEvidenceEditor({ getWorkspace, getItem, getSegment, changed
   }
   function draftFor(itemID, segmentID) {
     const ws = workspace(), fact = getEvidenceFact(ws, itemID, segmentID), draftKey = key(itemID, segmentID);
-    const baseline = JSON.stringify(fact ? [fact.kind, fact.speaker_id, fact.review_status] : ['observation', '', 'needs_review']);
+    const source=ws.records[itemID].segments.find(segment=>segment.id===segmentID).annotations;
+    const baseline = JSON.stringify([source.observation_kind || fact?.kind || 'observation',source.speaker_id ?? fact?.speaker_id ?? '',fact?.review_status || 'needs_review']);
     let draft = drafts.get(draftKey);
     if (!draft || (!draft.dirty && draft.baseline !== baseline)) {
-      draft = { kind: fact?.kind || 'observation', speaker_id: fact?.speaker_id || '', review_status: fact?.review_status || 'needs_review', baseline, dirty: false, subjectsChanged: false };
+      draft = { kind: source.observation_kind || fact?.kind || 'observation', speaker_id: source.speaker_id ?? fact?.speaker_id ?? '', review_status: fact?.review_status || 'needs_review', baseline, dirty: false, subjectsChanged: false };
       drafts.set(draftKey, draft);
     }
     return draft;
@@ -73,21 +82,16 @@ export function mountEvidenceEditor({ getWorkspace, getItem, getSegment, changed
   }
   function renderStatus(itemID, segmentID) {
     const ws = workspace(), segment = ws.records[itemID].segments.find(entry => entry.id === segmentID), fact = getEvidenceFact(ws, itemID, segmentID), draft = draftFor(itemID, segmentID);
-    if (!fact) { report('填写描述后保存，即可在后续事件与情感标注中使用这条事实。', 'pending'); return; }
+    if (!fact) { report('草稿', 'pending'); return; }
     const ids = selectedIDs(itemID, segmentID);
-    const pending = description(segment, fact).trim() !== fact.text || draft.subjectsChanged && !sameIDs(ids, fact.subject_ids) || draft.kind !== fact.kind || (draft.kind === 'reported_speech' && draft.speaker_id !== fact.speaker_id) || draft.review_status !== fact.review_status;
-    const refs = ws.graph.links.filter(link => link.from_type === 'evidence' && link.to_type === 'fact' && link.to_id === fact.id).length;
-    report(pending ? '证据草稿已保留；点击“保存证据与事实”更新这条事实。' : '已关联事实，可直接用于复合事件与情感标注。', pending ? 'pending' : '');
-    if (!draft.subjectsChanged && !sameIDs(ids, fact.subject_ids)) {
-      const names = fact.subject_ids.slice(0, 5).map(id => ws.graph.entities.find(entity => entity.id === id)?.name || id).join('、');
-      $('evidence-fact-status').append(document.createTextNode(` 本事实描述对象：${names}${fact.subject_ids.length > 5 ? '等' : ''}；不会自动加入其他在场主体。`));
-    }
-    if (refs > 1) $('evidence-fact-status').append(document.createTextNode(` 此事实同时引用 ${refs} 个时间窗，修改描述将同步到该事实。`));
+    report(draft.dirty ? '草稿' : '已保存', draft.dirty ? 'pending' : '');
   }
+
   function markPending(itemID, segmentID, subjectsChanged = false) {
     const draft = draftFor(itemID, segmentID); draft.dirty = true; draft.review_status = 'needs_review';
     if (subjectsChanged) draft.subjectsChanged = true;
     $('evidence-fact-review').value = 'needs_review';
+    scheduleAuto();
   }
   function renderSubjects(itemID, segmentID) {
     const subjects = inventory(itemID, segmentID), selected = new Set(selectedIDs(itemID, segmentID)), container = $('evidence-subjects');
@@ -109,7 +113,7 @@ export function mountEvidenceEditor({ getWorkspace, getItem, getSegment, changed
         } catch (error) { restore(ws, before); render(); notify(error.message, true); }
       });
     }
-    if (!subjects.length) container.append(node('p', 'evidence-subject-empty', '还没有主体。先新建，再勾选本时间窗对应的人物；可选择多个。'));
+    if (!subjects.length) container.append(node('p', 'evidence-subject-empty', '暂无主体'));
   }
   function render() {
     const ws = workspace(), item = getItem(), segment = getSegment(); if (!ws || !item || !segment) return;
@@ -124,6 +128,7 @@ export function mountEvidenceEditor({ getWorkspace, getItem, getSegment, changed
     renderStatus(item.id, segment.id);
   }
   function saveOne(itemID, segmentID) {
+    validateSave?.(itemID, segmentID);
     const ws = workspace(), segment = ws.records[itemID].segments.find(entry => entry.id === segmentID), fact = getEvidenceFact(ws, itemID, segmentID), draft = draftFor(itemID, segmentID), ids = selectedIDs(itemID, segmentID);
     registerSelected(itemID, segmentID, ids);
     const factSubjects = fact && !draft.subjectsChanged ? fact.subject_ids : ids;
@@ -137,8 +142,8 @@ export function mountEvidenceEditor({ getWorkspace, getItem, getSegment, changed
       const result = saveOne(item.id, segment.id);
       if (result.modified || JSON.stringify(before.graph) !== JSON.stringify(ws.graph)) changed(false);
       await persist();
-      if (isCurrent(ws, item.id, segment.id)) { render(); onSaved?.(); report('证据与事实已保存，可继续标注本页或整理复合事件。'); }
-      notify('证据与事实已保存'); return result;
+      if (isCurrent(ws, item.id, segment.id)) { render(); onSaved?.(); report('证据已保存，可继续标注本页或整理复合事件。'); }
+      notify('证据已保存'); return result;
     } catch (error) { restore(ws, before); report(error.message, 'error'); throw error; }
   }
   function saveAll(itemID) {
@@ -158,12 +163,12 @@ export function mountEvidenceEditor({ getWorkspace, getItem, getSegment, changed
     const before = snapshot(ws);
     try {
       const ids = selectedIDs(item.id, segment.id); registerSelected(item.id, segment.id, ids);
-      const entity = { id: crypto.randomUUID(), name, aliases: [] }; ws.graph.entities.push(entity);
+      const entity = { id: nextAnnotationId(ws, 'entity'), name, aliases: [], item_id:item.id }; ws.graph.entities.push(entity);
       setEvidenceSubjects(ws, item.id, segment.id, [...ids, entity.id]);
       $('evidence-new-subject-name').value = ''; markPending(item.id, segment.id, true); changed(false); await persist(); render();
     } catch (error) { restore(ws, before); render(); notify(error.message, true); }
   });
-  $('evidence-new-subject-name').addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); $('evidence-add-subject').click(); } });
+  $('evidence-new-subject-name').addEventListener('keydown', event => {if(event.isComposing)return;if(event.key === 'Enter') { event.preventDefault(); $('evidence-add-subject').click(); }else if(event.key==='Backspace'&&!event.currentTarget.value){event.preventDefault();const item=getItem(),segment=getSegment();if(!item||!segment)return;setEvidenceSubjects(workspace(),item.id,segment.id,selectedIDs(item.id,segment.id).slice(0,-1));changed(false);persist();render();} });
   $('observation').addEventListener('input', () => {
     const segment = getSegment(), item = getItem(); if (!segment || !item || segment.annotations.observation === $('observation').value) return;
     segment.annotations.observation = $('observation').value; markPending(item.id, segment.id); changed(); onSaved?.(); renderStatus(item.id, segment.id);
@@ -175,6 +180,7 @@ export function mountEvidenceEditor({ getWorkspace, getItem, getSegment, changed
     if (id === 'evidence-fact-kind') { draft.kind = $(id).value; markPending(item.id, segment.id); }
     else if (id === 'evidence-fact-speaker') { draft.speaker_id = $(id).value; markPending(item.id, segment.id); }
     else { draft.review_status = $(id).value; draft.dirty = true; }
+    segment.annotations.observation_kind=draft.kind;segment.annotations.speaker_id=draft.speaker_id;persist();scheduleAuto();
     syncSpeaker(item.id, segment.id, draft); renderStatus(item.id, segment.id);
   });
   return { render, saveCurrent, saveAll, resetCurrent() { const item = getItem(), segment = getSegment(); if (item && segment) drafts.delete(key(item.id, segment.id)); }, hasUnsavedChanges() {

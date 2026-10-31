@@ -76,10 +76,10 @@ test('unchanged saves preserve completed graph, review decisions, edge identitie
 test('actual factual changes invalidate descendants but a review-only edit does not', () => {
   const ws = closedWorkspace();
   save(ws, { review_status: 'needs_review' });
-  assert.equal(ws.graph.status, 'draft'); assert.equal(ws.graph.events[0].review_status, 'confirmed'); assert.equal(ws.graph.emotion_states[0].review_status, 'confirmed');
+  assert.equal(ws.graph.status, 'complete'); assert.equal(ws.graph.events[0].review_status, 'confirmed'); assert.equal(ws.graph.emotion_states[0].review_status, 'confirmed');
   save(ws, { text: '主体 A 把文件放回桌上', review_status: 'confirmed' });
   assert.equal(ws.graph.events[0].review_status, 'needs_review'); assert.equal(ws.graph.emotion_states[0].review_status, 'needs_review');
-  assert.equal(ws.graph.facts[0].review_status, 'confirmed');
+  assert.equal(ws.graph.facts[0].review_status, 'needs_review');
 });
 test('subject changes invalidate fact interpretations and preserve unrelated entity records', () => {
   const ws = closedWorkspace(), factID = ws.graph.facts[0].id;
@@ -98,10 +98,10 @@ test('reported speech requires an explicit speaker selected in this window and f
   assert.equal(fact.speaker_id, 'A'); assert.equal(fact.kind, 'reported_speech');
 });
 test('only an unambiguous matching single-window legacy fact is reused; unrelated and shared facts are preserved', () => {
-  const ws = workspace(), { fact } = save(ws); delete ws.records.video.segments[0].annotations.fact_id;
+  const ws = workspace(), { fact } = save(ws); delete ws.records.video.segments[0].annotations.fact_id; delete ws.records.video.segments[0].annotations.fact_seeded;
   assert.equal(getEvidenceFact(ws, 'video', 'window').id, fact.id);
   assert.equal(save(ws).fact.id, fact.id);
-  delete ws.records.video.segments[0].annotations.fact_id;
+  delete ws.records.video.segments[0].annotations.fact_id; delete ws.records.video.segments[0].annotations.fact_seeded;
   ws.records.video.segments.push(cleanSegment({ id: 'another', start_time: 3, end_time: 4, label: 'visual_observation', annotations: {} }, ws.manifest.items[0]));
   ws.graph.links.push({ id: 'shared', from_type: 'evidence', from_id: evidenceKey('video', 'another'), to_type: 'fact', to_id: fact.id, type: 'supports' });
   assert.equal(getEvidenceFact(ws, 'video', 'window'), null);
@@ -109,7 +109,7 @@ test('only an unambiguous matching single-window legacy fact is reused; unrelate
   assert.equal(ws.graph.links.find(entry => entry.id === 'shared').to_id, fact.id);
 });
 test('multiple matching legacy facts are never silently merged or overwritten', () => {
-  const ws = workspace(), { fact } = save(ws); delete ws.records.video.segments[0].annotations.fact_id;
+  const ws = workspace(), { fact } = save(ws); delete ws.records.video.segments[0].annotations.fact_id; delete ws.records.video.segments[0].annotations.fact_seeded;
   ws.graph.facts.push({ ...fact, id: 'another-fact' });
   ws.graph.links.push({ id: 'another-support', from_type: 'evidence', from_id: ref, to_type: 'fact', to_id: 'another-fact', type: 'supports' });
   assert.equal(getEvidenceFact(ws, 'video', 'window'), null);
@@ -117,16 +117,21 @@ test('multiple matching legacy facts are never silently merged or overwritten', 
   assert.equal(ws.graph.facts.length, 3); assert.notEqual(result.fact.id, fact.id);
   assert.equal(ws.graph.facts.find(entry => entry.id === fact.id).text, fact.text);
 });
-test('editing an explicitly shared primary fact synchronizes only its bound description windows', () => {
+test('editing an evidence description never rewrites other windows of a shared fact', () => {
   const ws = workspace(), { fact } = save(ws);
   ws.records.video.segments.push(cleanSegment({ id: 'bound', start_time: 3, end_time: 4, label: 'visual_observation', annotations: { subject_id: 'A', subject_ids: ['A'], observation: fact.text, fact_id: fact.id, local_fact: '保留旧字段' } }, ws.manifest.items[0]));
   ws.records.video.segments.push(cleanSegment({ id: 'unbound', start_time: 5, end_time: 6, label: 'visual_observation', annotations: { subject_id: 'B', observation: '独立观察' } }, ws.manifest.items[0]));
   for (const id of ['bound', 'unbound']) ws.graph.links.push({ id: 'support-' + id, from_type: 'evidence', from_id: evidenceKey('video', id), to_type: 'fact', to_id: fact.id, type: 'supports' });
   save(ws, { text: '共享事实的新描述' });
-  assert.equal(ws.records.video.segments[1].annotations.observation, '共享事实的新描述');
+  assert.equal(ws.records.video.segments[1].annotations.observation, fact.text);
   assert.equal(ws.records.video.segments[1].annotations.local_fact, '保留旧字段');
   assert.deepEqual(ws.records.video.segments[1].annotations.subject_ids, ['A']);
   assert.equal(ws.records.video.segments[2].annotations.observation, '独立观察');
+});
+
+test('deleted initial facts do not regenerate when their atomic evidence is autosaved',()=>{
+  const ws=workspace(),{fact}=save(ws);removeGraphNode(ws,'fact',fact.id);const count=ws.graph.facts.length;
+  save(ws,{text:'Updated evidence only'});assert.equal(ws.graph.facts.length,count);assert.equal(ws.records.video.segments[0].annotations.observation,'Updated evidence only');
 });
 test('deleting a fact, support, subject or final mention removes only the corresponding canonical bindings', () => {
   for (const remove of ['fact', 'link']) {

@@ -1,3 +1,4 @@
+import { saveItemDownloadAndProjectSnapshot } from './project-snapshot.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -34,14 +35,11 @@ const check = name => { checks.push(name); console.log('PASS:', name); };
 const stage = async name => { await page.locator(`#graph-workbench button[data-stage="${name}"]`).click(); };
 async function downloadJSON(name, targetPage = page) {
   const [download] = await Promise.all([targetPage.waitForEvent('download'), targetPage.locator('#download-result').click()]);
-  const target = path.join(artifacts, name); await download.saveAs(target);
-  return JSON.parse(fs.readFileSync(target, 'utf8'));
+  const target = path.join(artifacts, name);
+  return saveItemDownloadAndProjectSnapshot(download, targetPage, target);
 }
 async function waitSaved() {
   await page.waitForFunction(() => document.getElementById('draft-status').textContent.includes('草稿已存'));
-}
-async function management() {
-  if (!(await page.locator('details.g-management').evaluate(node => node.open))) await page.locator('details.g-management > summary').click();
 }
 async function save(name, feedback) {
   await page.getByRole('button', { name, exact: true }).click();
@@ -116,26 +114,23 @@ try {
   assert.equal(evidenceOnly.graph.facts.length, 4, 'completing evidence now saves its four window facts in the same workflow');
   check('four independently editable video/audio evidence windows save their own linked facts when completed');
 
-  await management();
-  await page.locator('#g-entity-name').fill('合成主体 P1');
-  await page.locator('#g-entity-aliases').fill('画面主体，声音主体');
-  await save('保存主体', '主体已保存');
-  const entityID = await page.locator('#g-mention-entity option').filter({ hasText: '合成主体 P1' }).getAttribute('value');
-  assert.ok(entityID);
-  for (const [description, evidence] of [['第一视频窗中的画面主体', refs[0]], ['第一音频窗中的声音主体', refs[2]], ['第二视频窗中的画面主体', refs[1]], ['第二音频窗中的声音主体', refs[3]]]) {
-    const cancel = page.getByRole('button', { name: '取消编辑', exact: true });
-    if (await cancel.count()) await cancel.click();
-    await page.locator('#g-mention-description').fill(description);
-    await page.locator('#g-mention-entity').selectOption(entityID);
-    await page.locator('#g-mention-evidence').selectOption(evidence);
-    await save('新增提及', '主体提及已保存');
+  const entityID = 'common_test_subject';
+  const configured = structuredClone(evidenceOnly);
+  configured.batch_id = 'configured_cross_modal';
+  configured.graph.entities = [{ id: entityID, name: 'P1 (synthetic)', aliases: [] }];
+  configured.graph.mentions = refs.map((ref, n) => ({ id: `shared_mention_${n}`, entity_id: entityID, evidence_id: ref, description: 'Explicit imported coreference' }));
+  for (const fact of configured.graph.facts) { fact.subject_ids = [entityID]; if (fact.speaker_id) fact.speaker_id = entityID; }
+  for (const item of configured.items) {
+    item.subject_ids = [entityID];
+    item.timeline_id = 'scene_shared'; item.time_offset_s = item.media_type === 'audio' ? -.1 : 0;
+    for (const segment of item.segments) segment.annotations.subject_ids = [entityID];
   }
-  for (let index = 0; index < 2; index++) {
-    await page.locator(`#g-align-timeline-${index}`).fill('scene_shared');
-    await page.locator(`#g-align-offset-${index}`).fill(index ? '-0.1' : '0');
-    await page.locator('.g-alignment-row').nth(index).getByRole('button', { name: '保存对齐', exact: true }).click();
-    await page.waitForFunction(() => document.querySelector('.g-feedback').textContent.includes('媒体对齐已保存'));
-  }
+  await page.locator('#result-input').setInputFiles({ name: 'configured.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(configured)) });
+  await page.waitForFunction(() => document.getElementById('batch-id').value === 'configured_cross_modal');
+  await page.locator('#folder-input').setInputFiles(taskDir);
+  await page.locator('.task-item[data-media-type=audio]').click();
+  await page.waitForFunction(() => document.querySelector('#audio').readyState >= 2);
+  assert.equal(await page.locator('.g-management').count(), 0);
   const aligned = await downloadJSON('graph-aligned-evidence.json');
   assert.ok(aligned.graph.entities.some(entity => entity.id === entityID));
   const sharedMentions = aligned.graph.mentions.filter(mention => mention.entity_id === entityID);
@@ -149,7 +144,7 @@ try {
   await assertEditorLayout();
   for (const initial of evidenceOnly.graph.facts) {
     await page.locator(`.g-node[data-node-id="${initial.id}"]`).click();
-    await page.locator('#g-fact-review').selectOption('confirmed'); await save('保存事实', '事实已保存');
+    await save('保存事实', '事实已保存');
   }
   await page.getByRole('button', { name: '新增事实', exact: true }).click();
   await page.locator('#g-fact-text').fill('未提交的事实表单草稿');
@@ -178,19 +173,35 @@ try {
     await page.locator('#g-fact-kind').selectOption('observation');
     await page.locator('#g-fact-subjects').selectOption([entityID]);
     if (index) await page.locator('#g-fact-evidence').selectOption([refs[1], refs[3]]);
-    await page.locator('#g-fact-review').selectOption('confirmed');
-    assert.equal(await page.locator('#g-fact-review').inputValue(), 'confirmed', 'review selector immediately before saving');
+
+    assert.equal(await page.locator('select#g-fact-review').count(), 0, 'annotation does not expose a review selector');
     await save('保存事实', '事实已保存');
-    assert.equal(await page.locator('#g-fact-review').inputValue(), 'confirmed', 'review selector immediately after saving');
+    assert.equal(await page.locator('select#g-fact-review').count(), 0);
     factIDs.push(await page.locator('.g-node.active').getAttribute('data-node-id'));
   }
   const facts = await downloadJSON('graph-facts.json');
   assert.equal(facts.graph.facts.length, 6, 'four unified window facts remain alongside two explicit multimodal facts');
-  assert.ok(facts.graph.facts.every(fact => fact.review_status === 'confirmed'));
+  assert.ok(facts.graph.facts.every(fact => fact.text.trim()));
   assert.equal(facts.graph.links.filter(link => link.type === 'supports' && factIDs.includes(link.to_id)).length, 4);
   assert.deepEqual(facts.graph.links.filter(link => link.type === 'supports' && link.to_id === factIDs[0]).map(link => link.from_id).sort(), [refs[0], refs[2]].sort());
   check('visible reference cards support search, check/uncheck and counts while saved JSON retains exactly the selected evidence');
   check('independent confirmed facts each combine multiple video/audio evidence references');
+  const factTimeline = page.locator('[data-timeline-stage=facts]');
+  assert.equal(await page.locator('.g-layer-preview #audio').isVisible(), true);
+  assert.equal(await page.locator('#audio').count(), 1, 'stages reuse one media player');
+  assert.equal(await factTimeline.locator('.g-time-row[data-node-id]').count(), facts.graph.facts.length);
+  await factTimeline.locator(`.g-time-row[data-node-id="${factIDs[0]}"] .g-time-band`).first().click();
+  assert.equal(await page.locator('#g-fact-text').inputValue(), facts.graph.facts.find(f => f.id === factIDs[0]).text);
+  await page.waitForFunction(() => Math.abs(document.querySelector('#audio').currentTime - 1) < .05);
+  await factTimeline.getByRole('button', { name: '放大', exact: true }).click();
+  assert.equal(await factTimeline.locator('.g-time-canvas').evaluate(el => el.style.width), '200%');
+  await factTimeline.getByRole('button', { name: '全览', exact: true }).click();
+  await factTimeline.getByRole('searchbox').fill('不存在的时间条');
+  assert.equal(await factTimeline.locator('.g-time-row[data-node-id]').count(), 0);
+  await factTimeline.getByRole('searchbox').fill('');
+  assert.equal(await page.locator('#graph-workbench').getAttribute('data-unsaved-changes'), 'false');
+  await page.screenshot({ path: path.join(artifacts, 'fact-timeline.png'), fullPage: true });
+  check('fact timelines share the player, select semantic records, seek with offsets and zoom/filter without changing annotations');
 
   await stage('events');
   await assertEditorLayout();
@@ -202,9 +213,17 @@ try {
   await page.locator('#g-event-title').fill('P1 的合成测试信号发生改变');
   await page.locator('#g-event-subjects').selectOption([entityID]);
   await page.locator('#g-event-facts').selectOption(factIDs);
-  await page.locator('#g-event-review').selectOption('confirmed');
+
   await save('保存复合事件', '复合事件已保存');
   const eventID = await page.locator('.g-node.active').getAttribute('data-node-id');
+  assert.match(await page.locator('.g-derived-time').innerText(), /0\.9s → 2s ∪ 2\.9s → 4s/);
+  const eventExport = await downloadJSON('event-time-union.json');
+  assert.deepEqual(eventExport.derived.event_time_ranges[eventID], { status: 'derived', timeline_id: 'scene_shared', time_ranges: [{ start_time: 0.9, end_time: 2 }, { start_time: 2.9, end_time: 4 }] });
+  const eventTimeline = page.locator('[data-timeline-stage=events]');
+  assert.equal(await eventTimeline.locator(`.g-time-row[data-node-id="${eventID}"] .g-time-band`).count(), 2);
+  await eventTimeline.locator('.g-time-band').last().click();
+  assert.equal(await page.locator('#g-event-title').inputValue(), 'P1 的合成测试信号发生改变');
+  await page.screenshot({ path: path.join(artifacts, 'event-timeline.png'), fullPage: true });
   check('a specific event combines independent facts and derives its common source timeline');
 
   await stage('facts'); await downloadJSON('before-unsaved-form-check.json'); await waitSaved();
@@ -225,10 +244,10 @@ try {
   await stage('facts');
   assert.equal(await page.locator('#g-fact-text').inputValue(), unsavedFactText, 'saving an event must preserve a different stage\'s unsaved fact form');
   assert.equal(await page.locator('#graph-workbench').getAttribute('data-unsaved-changes'), 'true');
-  await page.locator('#g-fact-text').fill(originalFactText); await page.locator('#g-fact-review').selectOption('confirmed');
+  await page.locator('#g-fact-text').fill(originalFactText);
   await save('保存事实', '事实已保存');
   assert.equal(await page.locator('#graph-workbench').getAttribute('data-unsaved-changes'), 'false', 'saving the affected form must clear its unsaved flag');
-  await stage('events'); await page.locator('#g-event-review').selectOption('confirmed'); await save('保存复合事件', '复合事件已保存');
+  await stage('events'); await save('保存复合事件', '复合事件已保存');
   check('search stays clean, unsaved edits warn before leaving, unrelated saves preserve drafts and explicit save clears dirty state');
 
   await stage('emotions');
@@ -248,23 +267,26 @@ try {
     await page.locator('#g-state-intensity').selectOption(index ? '4' : '2');
     await page.locator('#g-state-facts').selectOption([factIDs[index]]);
     await page.locator('#g-state-events').selectOption([eventID]);
-    await page.locator('#g-state-review').selectOption('confirmed');
+
     await save('保存情感状态', '情感状态已保存');
     stateIDs.push(await page.locator('.g-emotions > .g-editor-layout').first().locator('.g-node.active').getAttribute('data-node-id'));
   }
-  await page.locator('#g-transition-subject').selectOption(entityID);
-  await page.locator('#g-transition-from').selectOption(stateIDs[0]);
-  await page.locator('#g-transition-to').selectOption(stateIDs[1]);
-  await page.locator('#g-transition-events').selectOption([eventID]);
-  await page.locator('#g-transition-relation').selectOption('associated_with');
-  await page.locator('#g-transition-note').fill('合成数据功能验收；仅标记关联，不推定因果。');
-  await page.locator('#g-transition-review').selectOption('confirmed');
-  await save('保存情感变化', '情感变化已保存');
-  check('one subject has grounded emotion states and an explicitly reviewed event-associated transition');
+  await page.locator(`.g-state-choice-row>input[data-state-id="${stateIDs[0]}"]`).check();
+  await page.locator(`.g-state-choice-row>input[data-state-id="${stateIDs[1]}"]`).check();
+  await page.locator('#g-connect-selected').click();
+  check('one subject has grounded emotion states and one direct state-change edge');
+  const emotionTimeline = page.locator('[data-timeline-stage=emotions]');
+  assert.equal(await emotionTimeline.locator('.g-time-row[data-node-type=emotion_state]').count(), 2);
+  assert.equal(await emotionTimeline.locator('.g-time-row[data-node-type=emotion_relation] .g-time-band').count(), 2);
+  assert.equal(await emotionTimeline.locator('.g-time-connector').count(), 1);
+  await emotionTimeline.locator(`.g-time-row[data-node-id="${stateIDs[0]}"] .g-time-band`).click();
+  assert.equal(await page.locator('#g-state-label').inputValue(), '平稳（合成验收）');
+  await page.screenshot({ path: path.join(artifacts, 'emotion-timeline.png'), fullPage: true });
+  check('emotion timelines visualize state intervals and separate transition endpoints and select the corresponding editor');
 
   await stage('graph');
   await page.waitForSelector('#g-directed-svg');
-  assert.equal(await page.locator('details.g-management').evaluate(details => details.open), false);
+  assert.equal(await page.locator('details.g-management').count(), 0);
   const fitMetrics = await page.locator('.g-svg-viewport').evaluate(viewport => ({ mode: viewport.dataset.sizeMode, width: viewport.clientWidth, svg: viewport.querySelector('svg').getBoundingClientRect().width }));
   assert.equal(fitMetrics.mode, 'fit'); assert.ok(fitMetrics.svg <= fitMetrics.width + 1);
   await page.locator('#g-graph-original').click();
@@ -275,28 +297,63 @@ try {
   assert.equal(await page.locator('#g-graph-fit').getAttribute('aria-pressed'), 'true');
   assert.ok(await page.locator('#g-directed-svg [marker-end]').count() >= 9);
   assert.ok(await page.locator('#g-directed-svg [data-node-type=evidence]').count() >= 4);
+  assert.equal(await page.locator('#g-directed-svg [data-timeline-layer]').count(),4);
+  assert.equal(await page.locator('.g-relation-list').count(),0);
+  const positionsBefore = await page.locator('#g-directed-svg [data-node-type]').evaluateAll(nodes=>nodes.map(n=>[n.dataset.nodeId,[n.querySelector('circle')?.getAttribute('cx'),n.querySelector('circle')?.getAttribute('cy')]]));
+  const originalRange=await page.locator('#g-directed-svg').evaluate(svg=>Number(svg.dataset.rangeEnd)-Number(svg.dataset.rangeStart));
+  const layout=await page.locator('.g-graph-layout').evaluate(el=>({graph:el.querySelector('.g-directed-graph').getBoundingClientRect().right,list:el.querySelector('.g-graph-browser').getBoundingClientRect().left,height:el.querySelector('svg').getBoundingClientRect().height}));
+  assert.ok(layout.list>=layout.graph,'node list is on the right');assert.ok(layout.height>300,'four fixed lines have a larger visible canvas');
+  assert.equal(await page.locator('#g-validation').count(),0);
+  assert.equal(await page.locator('.g-graph-category-tabs [role=tab]').count(),4);
+  assert.equal(await page.locator('.g-graph-column:visible').count(),1);
+  assert.equal(await page.locator('#g-graph-range-full').getAttribute('aria-pressed'),'true');
+  const stateNode=page.locator('#g-directed-svg [data-node-type=emotion_state]').first();
+  const stateID=await stateNode.getAttribute('data-node-id');
+  await page.locator('#g-graph-category-emotion_state').click();
+  await page.locator('#g-graph-node-search').fill(stateID);
+  assert.equal(await page.locator('.g-graph-browser .g-graph-node:visible').count(),1);
+  await page.locator(`.g-graph-browser .g-graph-node[data-node-id="${stateID}"]`).click();
+  for(const type of ['evidence','fact','event','emotion_state']) assert.ok(await page.locator(`#g-directed-svg [data-node-type=${type}][data-related=true]`).count()>0,`selected state highlights ${type} path`);
+  const after=await page.locator('#g-directed-svg [data-node-type]').evaluateAll(nodes=>nodes.map(n=>[n.dataset.nodeId,[n.querySelector('circle')?.getAttribute('cx'),n.querySelector('circle')?.getAttribute('cy')]]));
+  assert.deepEqual(after.sort(),positionsBefore.sort(),'focus keeps nodes on the same four tracks');
+  assert.ok(await page.locator('#g-directed-svg').evaluate(svg=>Number(svg.dataset.rangeEnd)-Number(svg.dataset.rangeStart))===originalRange,'selecting a node preserves the full time range');
+  assert.ok(await page.locator('#g-directed-svg [data-related=false][data-node-type]').count()>0);
+  assert.ok(await page.locator('.g-upstream-summary [data-node-type=evidence]').count()>0);
+  assert.ok(await page.locator('.g-upstream-summary [data-node-type=fact]').count()>0);
+  assert.ok(await page.locator('.g-upstream-summary [data-node-type=event]').count()>0);
+  await page.screenshot({path:path.join(artifacts,'graph-upstream-summary.png'),fullPage:true});
+  await page.locator('#g-graph-show-all').click();
+  await page.locator('#g-graph-category-evidence').click();
+  await page.locator('#g-graph-node-search').fill('');
+  assert.equal(await page.locator('#g-directed-svg [data-related=false][data-node-type]').count(),0);
+  assert.equal(await page.locator('.g-graph-node[data-node-type=evidence]').first().locator('.g-node-type-tag').count(),1);
+  assert.ok(!(await page.locator('.g-graph-node[data-node-type=evidence]').first().innerText()).includes('合成测试视频'));
+  await page.locator('#g-graph-range-full').click();assert.equal(await page.locator('#g-graph-range-full').getAttribute('aria-pressed'),'true');
+  await page.locator('#g-graph-range-annotations').click();
+  await page.locator('#g-graph-range-full').click();
+  check('four larger tracks keep full time scale on selection; category tabs and upstream summaries display matching nodes');
   const [svgDownload] = await Promise.all([page.waitForEvent('download'), page.locator('#g-export-svg').click()]);
   const svgFile = path.join(artifacts, 'four-layer-directed-graph.svg'); await svgDownload.saveAs(svgFile);
   const svgText = fs.readFileSync(svgFile, 'utf8');
   assert.ok(svgText.includes('<svg') && svgText.includes('marker-end') && svgText.includes('合成'));
   assert.ok(svgText.includes('width="1450"'), 'exported SVG keeps its complete original canvas independently of display zoom');
-  await page.locator('#g-directed-svg [data-node-type=evidence]').first().click();
+  await page.locator('.g-graph-browser [data-node-type=evidence]').first().click();
   await page.getByRole('button', { name: '回放此证据', exact: true }).click();
   await page.waitForSelector('.editor-grid:not([hidden])');
   await page.waitForFunction(() => !document.getElementById('video').seeking && document.getElementById('video').readyState >= 2);
   assert.ok(Math.abs(await page.locator('#video').evaluate(video => video.currentTime) - 1) < .03, 'cross-file graph evidence navigation seeks to the selected evidence start');
   await stage('graph');
-  await page.getByRole('button', { name: '标记四层完成', exact: true }).click();
-  await page.waitForFunction(() => document.querySelector('.g-status').textContent === '四层已完成');
+  await page.locator('#g-graph-show-all').click();
+  assert.equal(await page.locator('#g-validation').count(),0);
   const complete = await downloadJSON('four-layer-complete.json');
   const normalized = parseResults(complete);
-  assert.equal(complete.schema_version, '2.0'); assert.equal(complete.graph.status, 'complete');
+  assert.equal(complete.schema_version, '2.0'); assert.equal(complete.graph.status, 'draft');
   assert.equal(graphIssues(normalized).filter(issue => issue.severity === 'error').length, 0);
   await page.screenshot({ path: path.join(artifacts, 'four-layer-directed-graph.png'), fullPage: true });
-  check('saved cross-layer relationships generate arrow-directed SVG, export locally and pass four-layer completion checks');
+  check('saved cross-layer relationships export locally as editable annotations without a graph completion panel');
 
   await page.locator('#result-input').setInputFiles(path.join(artifacts, 'four-layer-complete.json'));
-  await page.waitForFunction(() => document.querySelector('.g-status').textContent === '四层已完成');
+  await page.waitForFunction(() => document.querySelector('.g-status').textContent === '四层待完成');
   const roundtrip = await downloadJSON('four-layer-roundtrip.json');
   assert.deepEqual(roundtrip.graph, complete.graph);
   await waitSaved(); await page.reload(); await restoreLatest(); await page.waitForSelector('#workspace:not([hidden])');
@@ -307,7 +364,7 @@ try {
   await page.waitForFunction(() => Boolean(navigator.serviceWorker.controller));
   await context.setOffline(true); await page.reload(); await restoreLatest(); await page.waitForSelector('#workspace:not([hidden])');
   await stage('graph'); await page.waitForSelector('#g-directed-svg');
-  assert.equal(await page.locator('.g-status').textContent(), '四层已完成');
+  assert.equal(await page.locator('.g-status').textContent(), '四层待完成');
   await context.setOffline(false);
   check('2.0 JSON roundtrip, browser reload and fully offline graph restoration preserve all nodes and relationships');
 
@@ -322,7 +379,7 @@ try {
   assert.ok(invalidated.graph.facts.some(fact => fact.review_status === 'needs_review'));
   assert.ok(invalidated.graph.events.every(event => event.review_status === 'needs_review'));
   assert.ok(invalidated.graph.emotion_states.some(state => state.review_status === 'needs_review'));
-  assert.ok(invalidated.graph.emotion_transitions.every(transition => transition.review_status === 'needs_review'));
+  assert.equal(invalidated.graph.links.filter(link => link.type === 'transitions_to').length, 1);
   page.once('dialog', dialog => dialog.accept()); await page.locator('#delete-segment').click();
   const removedEvidence = await downloadJSON('four-layer-evidence-deleted.json');
   await assertNoDangling(removedEvidence);

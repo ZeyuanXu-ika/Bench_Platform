@@ -1,3 +1,4 @@
+import { saveItemDownloadAndProjectSnapshot } from './project-snapshot.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -66,8 +67,8 @@ async function load(data) {
 }
 async function download(name) {
   const [download] = await Promise.all([page.waitForEvent('download'), page.locator('#download-result').click()]);
-  const filename = path.join(artifacts, `subject-lineage-${name}.json`); await download.saveAs(filename);
-  const data = JSON.parse(fs.readFileSync(filename, 'utf8')); parseResults(data); return data;
+  const filename = path.join(artifacts, `subject-lineage-${name}.json`); const project = await saveItemDownloadAndProjectSnapshot(download, page, filename);
+  const data = project; parseResults(data); return data;
 }
 async function save(name, message) {
   await page.getByRole('button', { name, exact: true }).click();
@@ -137,12 +138,11 @@ try {
   await page.locator('#g-state-label').fill('紧张'); await page.locator('#g-state-start').fill('6'); await page.locator('#g-state-end').fill('8');
   await save('保存情感状态', '情感状态已保存');
   const secondStateData = await download('second-state'); const stateB = secondStateData.graph.emotion_states.find(entry => entry.id !== stateA.id);
-  assert.equal(await expectSingle('g-transition-subject', '主体甲'), subjectA);
-  await page.locator('#g-transition-from').selectOption(stateA.id); await page.locator('#g-transition-to').selectOption(stateB.id);
-  await choose('g-transition-events', eventA.id); await page.locator('#g-transition-note').fill('两状态之间存在变化，仅记录事件关联。');
-  await save('保存情感变化', '情感变化已保存');
+  await page.locator(`.g-state-choice-row>input[data-state-id="${stateA.id}"]`).check();
+  await page.locator(`.g-state-choice-row>input[data-state-id="${stateB.id}"]`).check();
+  await page.locator('#g-connect-selected').click();
   const fourLayers = await download('four-layers');
-  assert.equal(fourLayers.graph.emotion_transitions[0].subject_id, subjectA);
+  assert.ok(fourLayers.graph.links.some(link => link.type === 'transitions_to' && link.from_id === stateA.id && link.to_id === stateB.id));
   assert.ok(!fourLayers.graph.facts.some(entry => entry.subject_ids.includes('unrelated_first')));
   check('fact, compound event, emotion states and transition keep the inherited subject ID instead of selecting the first global entity');
 

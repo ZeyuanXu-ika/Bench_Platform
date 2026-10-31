@@ -1,11 +1,15 @@
 import { LABELS, MAX_JSON_BYTES, MAX_ITEMS, MAX_SEGMENTS, MEDIA_RE, blankRecord, cleanSegment, completionErrors,
-  displayTime, editInterval, identifier, makeExport, manifestFromFiles, matchFile, newWorkspace, parseManifest, parseResults, planMediaImport, safeFilename } from './core.mjs';
+  displayTime, editInterval, identifier, makeExport, makeItemExport, makeItemExportFiles, packAnnotationFiles, manifestFromFiles, matchFile, newWorkspace, parseManifest, parseResults, planMediaImport, safeFilename, createWorkspaceHistory } from './core.mjs';
 import { listWorkspaces, removeWorkspace, storeWorkspace } from './storage.mjs';
-import { evidenceKey, invalidateEvidence, removeEvidence, migrateLegacyGraph } from './graph.mjs';
-import { mountGraphWorkbench } from './graph-ui.mjs';
+import { evidenceKey, invalidateEvidence, removeEvidence, migrateLegacyGraph, nextAnnotationId, annotationIdCounters, assertEvidenceTimeChange } from './graph.mjs';
+import { pairMaterialResults } from './material-results.mjs';
+import { mountGraphWorkbench, uiIcon } from './graph-ui.mjs';
 import { mountEvidenceEditor } from './evidence-editor.mjs';
+import { annotationNodePresentation } from './graph-view.mjs';
+import { packTimelineRows } from './annotation-timeline.mjs';
 
 const $ = id => document.getElementById(id);
+function paintPlayIcon(paused){$('play-toggle').replaceChildren(uiIcon(paused?'play':'pause'));$('play-toggle').title=paused?'播放（空格）':'暂停（空格）';}
 const SETTINGS_KEY = `bench-settings-v1:${new URL('.', location.href).pathname}`;
 const DEFAULT_SETTINGS = { height: 'auto', fit: 'contain', speed: '1', step: '0.1', export: 'picker' };
 let settings = { ...DEFAULT_SETTINGS };
@@ -30,6 +34,13 @@ let frameEdit = null;
 let frameSeek = 0;
 let graphWorkbench;
 let evidenceEditor;
+let pairingItemID=null;
+const evidenceTimeConflicts = new Map();
+function validateEvidenceTimeSave(itemID, segmentID) {
+  const conflict = evidenceTimeConflicts.get(JSON.stringify([ws?.id,itemID,segmentID]));
+  if (conflict) { const error=new Error(`请先调整时间冲突后再保存：${conflict}`);error.code='TEMPORAL_ORDER';throw error; }
+}
+const annotationHistory = createWorkspaceHistory();
 const item = () => ws?.manifest.items[ws.index];
 const record = () => ws?.records[item()?.id];
 const segment = () => record()?.segments.find(s => s.id === selected);
@@ -64,6 +75,8 @@ function changed(invalidate = true) {
     const segments = segment() ? [segment()] : record().segments;
     invalidateEvidence(ws, segments.map(seg => evidenceKey(item().id, seg.id)));
   }
+  ws.id_counters = annotationIdCounters(ws);
+  annotationHistory.record(ws);
   ws.revision++; ws.updated_at = new Date().toISOString();
   status('修改尚未导出 · 正在记录草稿');
   clearTimeout(draftTimer); draftTimer = setTimeout(enqueueDraft, 350);
@@ -74,7 +87,6 @@ function renderProgress() {
   if (!ws) return;
   const completed = ws.manifest.items.filter(x => ws.records[x.id].status === 'complete').length;
   $('progress').max = ws.manifest.items.length; $('progress').value = completed;
-  $('task-count').textContent = ws.manifest.items.length;
   $('progress-label').textContent = `${completed} / ${ws.manifest.items.length} 素材证据已标记`;
   $('progress-percent').textContent = `${Math.round(completed / ws.manifest.items.length * 100)}%`;
   renderTaskList();
@@ -91,7 +103,10 @@ function renderTaskList() {
     b.type = 'button'; b.setAttribute('aria-current', index === ws.index ? 'true' : 'false');
     b.append(el('span', 'task-dot', rec.status === 'complete' ? '✓' : String(index + 1).padStart(2, '0')));
     const info = el('span'); info.append(el('span', 'task-name', task.title), el('span', 'task-meta', `${task.media_type === 'video' ? '视频' : '音频'} · ${task.id}`));
-    b.append(info); b.addEventListener('click', run(() => switchItem(index))); fragment.append(b);
+    const source=el('span','task-annotation-source',rec.annotation_source?`标注：${rec.annotation_source.file_name}`:'标注：未配对');info.append(source);
+    b.append(info); b.addEventListener('click', run(() => switchItem(index)));
+    const row=el('div','task-entry');row.dataset.itemId=task.id;row.append(b);
+    const pair=el('button','task-pair-button',rec.annotation_source?'更换标注':'配对标注');pair.type='button';pair.setAttribute('aria-label',`为 ${task.id} 配对标注`);pair.addEventListener('click',run(async()=>{await switchItem(index);pairingItemID=task.id;$('result-input').multiple=false;$('result-input').click();}));row.append(pair);fragment.append(row);
   }
   $('task-list').replaceChildren(fragment);
   $('task-list').scrollTop = scrollTop;
@@ -119,6 +134,8 @@ function renderTimeline() {
   const duration = item()?.duration_s;
   $('timeline-draw').setAttribute('aria-disabled', String(!loaded));
   $('timeline-duration').textContent = duration ? `0:00 — ${displayTime(duration)}` : '等待加载素材';
+  const laneFor=new Map();
+  if(duration)for(const [index,lane] of packTimelineRows(record().segments.map(segment=>({id:segment.id,type:'evidence',time_ranges:[{start_time:segment.start_time,end_time:segment.end_time}]}))).entries()){const element=el('div','timeline-lane');element.dataset.lane=index;frag.append(element);for(const row of lane.rows)laneFor.set(row.id,element);}
   if (duration) for (const seg of record().segments) {
     const b = el('button', 'timeline-segment' + (seg.id === selected ? ' active' : ''));
     b.dataset.segmentId = seg.id;
@@ -126,7 +143,10 @@ function renderTimeline() {
     b.style.width = `${Math.max(0.2, Math.min(100, (seg.end_time - seg.start_time) / duration * 100))}%`;
     b.style.backgroundColor = LABELS.find(x => x.id === seg.label).color;
     b.title = `${LABELS.find(x => x.id === seg.label).name} ${displayTime(seg.start_time)}–${displayTime(seg.end_time)}`;
-    b.append(el('span', 'timeline-segment-label', LABELS.find(x => x.id === seg.label).name));
+    const display = annotationNodePresentation(ws, 'evidence', {id:evidenceKey(item().id,seg.id),item_id:item().id,segment_id:seg.id,modality:seg.label});
+    b.title = `${display.heading}\n${display.content}\n${b.title}`;
+    const text = el('span','timeline-segment-label'); text.append(el('strong','',display.heading),el('small','',display.content));
+    b.append(text,el('small','timeline-type-tag',display.tag));
     if (seg.id === selected && loaded) {
       b.title += ' · 拖动框身整体移动，拖动左右边缘调整起止点';
       for (const edge of ['start', 'end']) {
@@ -137,7 +157,7 @@ function renderTimeline() {
     }
     b.setAttribute('aria-label', b.title);
     b.addEventListener('click', e => { if (!e.detail || !loaded) selectSegment(seg.id); });
-    const lane = el('div', 'timeline-lane'); lane.append(b); frag.append(lane);
+    laneFor.get(seg.id).append(b);
   }
   $('timeline').replaceChildren(frag);
 }
@@ -162,7 +182,8 @@ function renderSegments() {
 }
 function renderDetail() {
   const seg = segment();
-  $('segment-detail').hidden = !seg; $('detail-empty').hidden = Boolean(seg);
+  $('segment-detail').hidden = !seg; $('detail-empty').hidden = true;
+  document.querySelector('.detail-top').hidden=!seg;
   $('delete-segment').disabled = !seg;
   $('build-fact').disabled = !seg;
   if (!seg) return;
@@ -213,7 +234,7 @@ function cancelFrameEdit() {
   edit.node.classList.remove('dragging');
   frameEdit = null;
   if ($('timeline').hasPointerCapture(edit.pointer)) $('timeline').releasePointerCapture(edit.pointer);
-  $('timeline-selection').textContent = '选中时间框后，拖动框身移动；拖动左右边缘调整起止时间。';
+  $('timeline-selection').textContent = '';
 }
 function newSegment() {
   if (!ws) return;
@@ -235,7 +256,7 @@ function addSegment() {
   if (!ws || !loaded) throw new Error('请先选择并加载本地素材');
   if ($('segment-start').value === '' || $('segment-end').value === '') throw new Error('请先标记起点和终点');
   if (record().segments.length >= MAX_SEGMENTS) throw new Error('单条素材最多支持 1000 个时间窗，请拆分任务');
-  const next = cleanSegment({ id: crypto.randomUUID(), start_time: Number($('segment-start').value), end_time: Number($('segment-end').value),
+  const next = cleanSegment({ id: nextAnnotationId(ws, 'evidence'), start_time: Number($('segment-start').value), end_time: Number($('segment-end').value),
     label: 'unclassified', annotations: {} }, item());
   record().segments.push(next);
   selected = next.id; activeLabel = next.label; changed(); renderSegments(); renderDetail();
@@ -248,14 +269,17 @@ function updateSelectedTimes() {
   try {
     if ($('segment-start').value === '' || $('segment-end').value === '') throw new Error('起点和终点不能为空');
     const next = cleanSegment({ ...old, start_time: Number($('segment-start').value), end_time: Number($('segment-end').value) }, item());
+    assertEvidenceTimeChange(ws, item().id, next);
+    evidenceTimeConflicts.delete(JSON.stringify([ws.id,item().id,next.id]));
     if (next.start_time !== old.start_time || next.end_time !== old.end_time) {
       record().segments[record().segments.indexOf(old)] = next;
       changed(); renderSegments(); renderDetail();
       if (loaded) currentMedia.currentTime = next.start_time;
     }
-    $('time-edit-hint').textContent = '选中时间窗的起止时间已保存。新建将使用当前区间创建独立的空白时间窗。';
+    $('time-edit-hint').textContent = '时间已保存';
     enqueueDraft();
   } catch (error) {
+    if(error.code==='TEMPORAL_ORDER')evidenceTimeConflicts.set(JSON.stringify([ws.id,item().id,old.id]),error.message);
     $('time-edit-hint').textContent = `时间未保存：${error.message}`;
     notify(error.message, true);
   }
@@ -267,7 +291,7 @@ function releaseMedia() {
   if (mediaURL) URL.revokeObjectURL(mediaURL);
   mediaURL = null; currentMedia = null;
   $('seek').disabled = true;
-  $('current-time').textContent = displayTime(0); $('seek').value = 0; $('play-toggle').textContent = '▶';
+  $('current-time').textContent = displayTime(0); $('seek').value = 0; paintPlayIcon(true);
 }
 function loadMedia() {
   releaseMedia();
@@ -297,11 +321,27 @@ function renderCurrent() {
 }
 async function switchItem(index) {
   if (!ws || index < 0 || index >= ws.manifest.items.length) return;
+  graphWorkbench?.autosave();
   await enqueueDraft(); ws.index = index; renderCurrent(); await enqueueDraft();
 }
 async function activate(next, message) {
   await enqueueDraft(); ws = next; attached = new Map(); selected = null;
+  annotationHistory.reset(ws);
   renderWorkspace(); await enqueueDraft(); if (message) notify(message);
+}
+async function undoAnnotation() {
+  if (!ws || !annotationHistory.canUndo) return;
+  if (frameEdit) cancelFrameEdit();
+  const currentID = item()?.id, mediaPath = item()?.media_path;
+  if (!annotationHistory.undo(ws)) return;
+  const index = ws.manifest.items.findIndex(task => task.id === currentID);
+  ws.index = index >= 0 ? index : Math.max(0, Math.min(ws.index, ws.manifest.items.length - 1));
+  if (!record()?.segments.some(segment => segment.id === selected)) selected = null;
+  graphWorkbench?.restoreAfterUndo();
+  for (const [id, key] of [['batch-id', 'batch_id'], ['assignment-id', 'assignment_id'], ['annotator-id', 'annotator_id']]) $(id).value = ws.manifest[key];
+  if (item()?.id !== currentID || item()?.media_path !== mediaPath) renderCurrent();
+  else { renderProgress(); renderTaskList(); renderSegments(); renderDetail(); }
+  changed(false); await enqueueDraft(); notify('已撤回上一步标注修改');
 }
 async function readJSON(file) {
   if (!file) return null;
@@ -313,10 +353,16 @@ async function importManifest(file) {
   const next = newWorkspace(parseManifest(await readJSON(file)));
   await activate(next, '任务清单已导入，请选择对应的本地素材文件或文件夹');
 }
-async function importResults(file) {
-  if (!file) return;
-  const next = parseResults(await readJSON(file));
-  await activate(next, '结果已恢复。片段和详情已保留，请重新选择本地素材以继续播放');
+async function importResults(files) {
+  const list=Array.from(files||[]);if(!list.length)return;
+  graphWorkbench?.autosave();await enqueueDraft();let next=ws;
+  for(const file of list){const imported=parseResults(await readJSON(file));
+    if(!next){next=imported;for(const task of next.manifest.items)next.records[task.id].annotation_source={file_name:file.name,material_id:task.id,annotation_id:task.id};}
+    else next=pairMaterialResults(next,imported,file.name,pairingItemID);
+  }
+  pairingItemID=null;
+  if(!ws){await activate(next,'标注已导入，请选择编号对应的本地素材');return;}
+  ws=next;selected=null;annotationHistory.reset(ws);renderWorkspace();await enqueueDraft();notify(`已配对 ${list.length} 个标注文件，仅更新对应素材`);
 }
 async function attachFiles(list) {
   const files = Array.from(list).filter(f => MEDIA_RE.test(f.name));
@@ -394,29 +440,45 @@ async function deleteTask() {
     notify('已从任务清单移除素材及其标注，本地原文件保留');
   } finally { $('delete-task').disabled = false; }
 }
-async function exportResults(forceDownload = false) {
+async function exportResults(forceDownload = false, allItems = false) {
   if (!ws || busy) return;
-  const payload = makeExport(ws);
-  const body = JSON.stringify(payload, null, 2) + '\n';
-  const name = `${safeFilename(payload.batch_id)}_${safeFilename(payload.assignment_id)}_${safeFilename(payload.annotator_id)}_r${payload.revision}.json`;
+  graphWorkbench?.assertReadyToExport(allItems ? null : item().id);
+  for(const [key,message] of evidenceTimeConflicts){const [workspaceID,itemID,segmentID]=JSON.parse(key);if(workspaceID===ws.id&&(allItems||itemID===item().id)&&ws.records[itemID]?.segments.some(segment=>segment.id===segmentID))throw new Error(`请先调整时间冲突后再保存：${message}`);}
+  const currentName = safeFilename(item().media_path.replaceAll('\\', '/').split('/').pop().replace(/\.[^.]+$/, '')) + '.json';
+  const files = allItems ? makeItemExportFiles(ws) : [{ name: currentName, payload: makeItemExport(ws, item().id) }];
   const exportID = ws.id; const revision = ws.revision;
-  busy = true; $('export-result').disabled = true; $('download-result').disabled = true;
+  const buttons = ['export-result', 'download-result', 'export-all']; busy = true; for (const id of buttons) $(id).disabled = true;
+  const download = (body, name, type) => {
+    const url = URL.createObjectURL(new Blob([body], { type }));
+    const link = el('a'); link.href = url; link.download = name; document.body.append(link); link.click(); link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  };
   try {
-    if (window.showSaveFilePicker && !forceDownload && settings.export !== 'download') {
-      const handle = await window.showSaveFilePicker({ suggestedName: name, types: [{ description: '标注结果 JSON', accept: { 'application/json': ['.json'] } }] });
-      const stream = await handle.createWritable(); await stream.write(body); await stream.close();
-      notify(`已保存到本地：${handle.name}`);
+    if (allItems && files.length > 1) {
+      if (window.showDirectoryPicker && !forceDownload && settings.export !== 'download') {
+        const folder = await window.showDirectoryPicker({ mode: 'readwrite' });
+        for (const file of files) {
+          const handle = await folder.getFileHandle(file.name, { create: true });
+          const stream = await handle.createWritable(); await stream.write(JSON.stringify(file.payload, null, 2) + '\n'); await stream.close();
+        }
+        notify(`已保存 ${files.length} 个独立 JSON，每条素材一个文件`);
+      } else {
+        const name = `${safeFilename(ws.manifest.batch_id)}_逐素材标注.zip`;
+        download(packAnnotationFiles(files), name, 'application/zip');
+        notify(`已发起下载：${name}\n压缩包内每条素材对应一个独立 JSON。`);
+      }
     } else {
-      const url = URL.createObjectURL(new Blob([body], { type: 'application/json;charset=utf-8' }));
-      const link = el('a'); link.href = url; link.download = name; document.body.append(link); link.click(); link.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 60000);
-      notify(`已发起下载：${name}\n请确认文件下载完成后，再上传飞书。`);
+      const file = files[0], body = JSON.stringify(file.payload, null, 2) + '\n';
+      if (window.showSaveFilePicker && !forceDownload && settings.export !== 'download') {
+        const handle = await window.showSaveFilePicker({ suggestedName: file.name, types: [{ description: '当前素材标注 JSON', accept: { 'application/json': ['.json'] } }] });
+        const stream = await handle.createWritable(); await stream.write(body); await stream.close(); notify(`已保存当前素材：${handle.name}`);
+      } else { download(body, file.name, 'application/json;charset=utf-8'); notify(`已发起下载：${file.name}（当前素材）`); }
     }
-    if (ws?.id === exportID) { ws.exported_revision = revision; await enqueueDraft(); }
+    if (ws?.id === exportID) { if (allItems || ws.manifest.items.length === 1) ws.exported_revision = revision; await enqueueDraft(); }
   } catch (e) {
     if (e.name === 'AbortError') notify('已取消导出，草稿仍保留在当前浏览器');
     else throw new Error(`导出未完成：${e.message}。可更换保存位置，或使用浏览器下载方式。`);
-  } finally { busy = false; $('export-result').disabled = false; $('download-result').disabled = false; }
+  } finally { busy = false; for (const id of buttons) $(id).disabled = false; }
 }
 async function completeItem() {
   if (!attached.has(item().id) || !loaded) throw new Error('请先关联并确认这条任务的本地素材');
@@ -464,8 +526,8 @@ for (const [mediaID, kind] of [['video', 'video'], ['audio', 'audio']]) {
   });
   media.addEventListener('error', () => { if (currentMedia === media && media.hasAttribute('src')) notify('当前浏览器无法解码这份素材。请确认文件完整，或使用兼容的 MP4 / WebM / WAV / MP3 编码', true); });
   media.addEventListener('timeupdate', () => { if (currentMedia === media) { $('current-time').textContent = displayTime(media.currentTime); $('seek').value = media.currentTime; } });
-  media.addEventListener('play', () => { if (currentMedia === media) $('play-toggle').textContent = 'Ⅱ'; });
-  media.addEventListener('pause', () => { if (currentMedia === media) $('play-toggle').textContent = '▶'; });
+  media.addEventListener('play', () => { if (currentMedia === media) paintPlayIcon(false); });
+  media.addEventListener('pause', () => { if (currentMedia === media) paintPlayIcon(true); });
 }
 async function togglePlay() {
   if (!loaded) return notify('请先选择本地素材', true);
@@ -476,14 +538,10 @@ function step(direction) {
   currentMedia.pause(); const delta = item().video_fps ? 1 / item().video_fps : Number(settings.step);
   currentMedia.currentTime = Math.max(0, Math.min(currentMedia.duration, currentMedia.currentTime + delta * direction));
 }
-for (const id of ['import-manifest', 'welcome-manifest']) $(id).addEventListener('click', () => $('manifest-input').click());
-for (const id of ['import-result', 'welcome-result']) $(id).addEventListener('click', () => $('result-input').click());
+for (const id of ['import-result', 'welcome-result']) $(id).addEventListener('click', () => {pairingItemID=null;$('result-input').multiple=Boolean(ws);$('result-input').click();});
 for (const id of ['attach-media', 'welcome-media']) $(id).addEventListener('click', () => $('media-input').click());
-const attachButton = el('button', 'quiet', '关联素材'); attachButton.id = 'attach-existing';
-$('attach-media').after(attachButton);
-for (const id of ['attach-current', 'attach-existing']) $(id).addEventListener('click', () => $('attach-input').click());
-$('attach-folder').addEventListener('click', () => $('folder-input').click());
-for (const [id, fn] of [['manifest-input', files => importManifest(files[0])], ['result-input', files => importResults(files[0])], ['media-input', importMediaFiles], ['attach-input', attachFiles], ['folder-input', attachFiles]]) {
+$('attach-current').addEventListener('click', () => $('attach-input').click());
+for (const [id, fn] of [['manifest-input', files => importManifest(files[0])], ['result-input', files => importResults(files)], ['media-input', importMediaFiles], ['attach-input', attachFiles], ['folder-input', attachFiles]]) {
   $(id).addEventListener('change', run(async e => { const files = Array.from(e.target.files); e.target.value = ''; if (files.length) await fn(files); }));
 }
 for (const [id, key] of [['batch-id', 'batch_id'], ['assignment-id', 'assignment_id'], ['annotator-id', 'annotator_id']]) {
@@ -500,18 +558,17 @@ $('next-item').addEventListener('click', run(() => switchItem(ws.index + 1)));
 $('complete-item').addEventListener('click', run(completeItem));
 $('export-result').addEventListener('click', exportResultsHandler);
 $('download-result').addEventListener('click', () => { exportResults(true).catch(e => notify(e.message, true)); });
+$('export-all').addEventListener('click', () => { exportResults(false, true).catch(e => notify(e.message, true)); });
 function exportResultsHandler() { exportResults().catch(e => notify(e.message, true)); }
 for (const id of ['drafts-button', 'welcome-drafts']) $(id).addEventListener('click', run(showDrafts));
 $('delete-task').addEventListener('click', run(deleteTask));
 for (const id of ['segment-start', 'segment-end']) $(id).addEventListener('change', updateSelectedTimes);
 $('add-segment').addEventListener('click', run(addSegment));
-$('delete-segment').addEventListener('click', () => {
-  if (!segment()) return;
-  if (!window.confirm('删除选中的时间窗及其标注内容？')) return;
-  removeEvidence(ws, [evidenceKey(item().id, selected)]);
-  record().segments = record().segments.filter(s => s.id !== selected); record().status = 'draft'; selected = null; changed(false); renderSegments(); renderDetail();
-  enqueueDraft();
-});
+function deleteEvidenceWindow(ref){
+  const [itemID,segmentID]=JSON.parse(ref),record=ws?.records[itemID];if(!record?.segments.some(segment=>segment.id===segmentID))return;
+  removeEvidence(ws,[ref]);record.segments=record.segments.filter(segment=>segment.id!==segmentID);record.status='draft';if(item()?.id===itemID && selected===segmentID)selected=null;changed(false);renderSegments();renderDetail();enqueueDraft();
+}
+$('delete-segment').addEventListener('click',()=>{if(segment() && window.confirm('删除选中的时间窗及其标注内容？'))deleteEvidenceWindow(evidenceKey(item().id,selected));});
 $('play-toggle').addEventListener('click', run(togglePlay));
 $('step-back').addEventListener('click', () => step(-1)); $('step-forward').addEventListener('click', () => step(1));
 $('seek').addEventListener('input', () => { if (loaded) currentMedia.currentTime = Number($('seek').value); });
@@ -540,7 +597,7 @@ draw.addEventListener('pointermove', e => {
 });
 function cancelDrag() {
   drag = null; $('timeline-preview').hidden = true;
-  $('timeline-selection').textContent = '拖动创建时间框；选中列表中的框后修改类别。';
+  $('timeline-selection').textContent = '';
 }
 draw.addEventListener('pointerup', run(e => {
   if (!drag || e.pointerId !== drag.pointer) return;
@@ -594,11 +651,13 @@ timeline.addEventListener('pointerup', e => {
   if (!old || (old.start_time === nextTimes.start_time && old.end_time === nextTimes.end_time)) return;
   try {
     const next = cleanSegment({ ...old, ...nextTimes }, item());
+    assertEvidenceTimeChange(ws, item().id, next);
+    evidenceTimeConflicts.delete(JSON.stringify([ws.id,item().id,next.id]));
     record().segments[record().segments.indexOf(old)] = next;
     changed(); renderSegments(); renderDetail();
     $('segment-start').value = next.start_time.toFixed(3); $('segment-end').value = next.end_time.toFixed(3);
     currentMedia.currentTime = edit.mode === 'end' ? next.end_time : next.start_time;
-  } catch (error) { notify(error.message, true); }
+  } catch (error) { if(error.code==='TEMPORAL_ORDER'){evidenceTimeConflicts.set(JSON.stringify([ws.id,item().id,old.id]),error.message);$('time-edit-hint').textContent=`时间未保存：${error.message}`;}notify(error.message, true); }
 });
 timeline.addEventListener('pointercancel', cancelFrameEdit);
 timeline.addEventListener('lostpointercapture', cancelFrameEdit);
@@ -618,13 +677,13 @@ function fillSettings() {
 setupButton.addEventListener('click', () => {
   fillSettings();
   $('deployment-mode').textContent = ['127.0.0.1', 'localhost', '[::1]'].includes(location.hostname)
-    ? `本机运行 · ${location.origin} · 素材与结果保留在本机`
-    : '浏览器本地文件模式 · 素材与结果保留在当前设备';
-  $('setup-input-summary').textContent = ws ? `当前任务 ${ws.manifest.items.length} 条，已关联本地素材 ${attached.size} 条。` : '尚未导入任务。也可以在首页直接选择音视频，自动建立任务。';
+    ? `本机运行 · ${location.origin}`
+    : '浏览器本地文件模式';
+  $('setup-input-summary').textContent = ws ? `当前任务 ${ws.manifest.items.length} 条，已关联本地素材 ${attached.size} 条。` : '尚未导入素材。';
   $('settings-dialog').showModal();
 });
-for (const [button, input] of [['setup-manifest', 'manifest-input'], ['setup-folder', 'folder-input'], ['setup-result', 'result-input']]) {
-  $(button).addEventListener('click', () => { $('settings-dialog').close(); $(input).click(); });
+for (const [button, input] of [['setup-media', 'media-input'], ['setup-result', 'result-input']]) {
+  $(button).addEventListener('click', () => { $('settings-dialog').close();if(input==='result-input'){pairingItemID=null;$(input).multiple=Boolean(ws);}$(input).click(); });
 }
 $('save-settings').addEventListener('click', () => {
   for (const key of Object.keys(DEFAULT_SETTINGS)) settings[key] = $(`setting-${key}`).value;
@@ -638,8 +697,16 @@ applySettings();
 document.querySelectorAll('.close-dialog').forEach(b => b.addEventListener('click', () => b.closest('dialog').close()));
 document.querySelectorAll('dialog').forEach(d => d.addEventListener('click', e => { if (e.target === d && e.offsetX >= 0 && e.offsetY >= 0) { const r = d.getBoundingClientRect(); if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) d.close(); } }));
 document.addEventListener('keydown', e => {
+  if(e.defaultPrevented)return;
+  const nativeUndo = e.target.closest('textarea,select,[contenteditable="true"]') || (e.target instanceof HTMLInputElement && !['checkbox', 'radio', 'range', 'button', 'submit'].includes(e.target.type));
+  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'z' && !nativeUndo && !document.querySelector('dialog[open]')) {
+    e.preventDefault(); if (frameEdit) cancelFrameEdit(); else run(undoAnnotation)(); return;
+  }
   if (frameEdit) { if (e.key === 'Escape') { e.preventDefault(); cancelFrameEdit(); } return; }
+  if((e.key==='Enter'||e.key===' ') && e.target.closest('button,a,[role="button"]'))return;
+  if(ws && !nativeUndo && !e.ctrlKey && !e.metaKey && !e.altKey && !document.querySelector('dialog[open]') && (e.key==='Backspace'||e.key==='Delete') && graphWorkbench?.deleteSelectedReference()){e.preventDefault();return;}
   if (!ws || e.ctrlKey || e.metaKey || e.altKey || e.target.closest('input,textarea,select,[contenteditable="true"]') || document.querySelector('dialog[open]')) return;
+  if(e.key==='Backspace'||e.key==='Delete'){e.preventDefault();if(!graphWorkbench?.deleteSelected() && graphWorkbench?.stage==='evidence' && segment())deleteEvidenceWindow(evidenceKey(item().id,selected));return;}
   if (e.key === '[') { e.preventDefault(); markStart(); }
   else if (e.key === ']') { e.preventDefault(); markEnd(); }
   else if (e.key === 'Enter') { e.preventDefault(); run(addSegment)(); }
@@ -651,7 +718,7 @@ document.addEventListener('keydown', e => {
 window.addEventListener('beforeunload', e => {
   if (graphWorkbench?.hasUnsavedChanges?.() || evidenceEditor?.hasUnsavedChanges?.() || (ws && ws.revision !== ws.exported_revision && ws.revision > 0)) { e.preventDefault(); e.returnValue = ''; }
 });
-window.addEventListener('pagehide', () => { enqueueDraft(); });
+window.addEventListener('pagehide', () => { graphWorkbench?.retainDrafts(); enqueueDraft(); });
 
 function validateDraft(saved) {
   if (!saved.graph) saved = { ...saved, graph: migrateLegacyGraph(saved) };
@@ -662,14 +729,29 @@ function validateDraft(saved) {
   clean.index = Math.max(0, Math.min(saved.index || 0, clean.manifest.items.length - 1));
   clean.exported_revision = Number.isSafeInteger(saved.exported_revision) ? saved.exported_revision : -1;
   if (saved._storage_token) clean._storage_token = identifier(saved._storage_token, '草稿版本令牌');
+  if(Array.isArray(saved.ui_form_drafts)) clean.ui_form_drafts=structuredClone(saved.ui_form_drafts);
+  if(Array.isArray(saved.ui_temporal_conflicts)) clean.ui_temporal_conflicts=structuredClone(saved.ui_temporal_conflicts);
   return clean;
 }
 evidenceEditor = mountEvidenceEditor({
   getWorkspace: () => ws, getItem: item, getSegment: segment,
-  changed, persist: enqueueDraft, notify, onSaved: renderSegments
+  changed, persist: enqueueDraft, notify, onSaved: renderSegments, validateSave: validateEvidenceTimeSave
 });
 graphWorkbench = mountGraphWorkbench($('graph-workbench'), {
   getWorkspace: () => ws,
+  persistDraft:enqueueDraft,deleteEvidence:deleteEvidenceWindow,
+  canUndo: () => annotationHistory.canUndo,
+  onUndo: run(undoAnnotation),
+  pausePlayback: () => currentMedia?.pause(),
+  getPlaybackTime: () => currentMedia && loaded && item() ? { timeline_id: item().timeline_id || item().source_id || item().id,
+    time: currentMedia.currentTime + (item().time_offset_s ?? item().clip_start_s ?? 0) } : null,
+  seekTimeline: (timelineID, time) => {
+    if (!currentMedia || !loaded || !item() || (item().timeline_id || item().source_id || item().id) !== timelineID) return false;
+    const local = time - (item().time_offset_s ?? item().clip_start_s ?? 0);
+    if (local < 0 || local > currentMedia.duration) return false;
+    currentMedia.currentTime = local; $('seek').value = local; $('current-time').textContent = displayTime(local);
+    return true;
+  },
   changed: async () => { if (ws) { changed(false); await enqueueDraft(); } },
   onFactSaved: factID => { if (factID && segment()?.annotations.fact_id === factID) evidenceEditor.resetCurrent(); renderDetail(); renderSegments(); },
   navigateEvidence: async (itemID, segmentID) => {
@@ -684,8 +766,12 @@ graphWorkbench = mountGraphWorkbench($('graph-workbench'), {
 $('segment-category').closest('label').firstChild.textContent = '证据类型';
 $('evidence-role').closest('label').firstChild.textContent = '后续用途提示';
 $('progress').setAttribute('aria-label', '素材证据标记进度');
-document.querySelector('.brand-sub').textContent = '多模态四层标注工作台';
+document.querySelector('.brand-sub').textContent = '多模态标注工作台';
 $('complete-item').textContent = '证据标记完成并继续';
 $('build-fact').addEventListener('click', run(() => evidenceEditor.saveCurrent()));
+for(const [id,name] of Object.entries({'help-button':'help','settings-button':'settings','welcome-media':'import','welcome-result':'file','welcome-drafts':'history','attach-media':'plus','import-result':'file','export-result':'save','download-result':'download','export-items':'download','delete-task':'trash','add-segment':'plus','delete-segment':'trash','build-fact':'save','attach-current':'import'})){
+  const target=$(id);if(target&&!target.querySelector('.ui-icon'))target.prepend(uiIcon(name));
+}
+paintPlayIcon(true);
 // Start empty. Existing drafts stay in IndexedDB until explicitly restored.
 if ('serviceWorker' in navigator && window.isSecureContext) navigator.serviceWorker.register('./sw.js').catch(() => {});

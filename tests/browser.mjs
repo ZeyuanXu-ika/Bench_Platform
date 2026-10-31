@@ -1,3 +1,4 @@
+import { saveItemDownloadAndProjectSnapshot } from './project-snapshot.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -86,7 +87,7 @@ try {
 
   await page.evaluate(() => { Object.defineProperty(window, 'showSaveFilePicker', { configurable: true, value: undefined }); });
   const [download] = await Promise.all([page.waitForEvent('download'), page.locator('#export-result').click()]);
-  const exportPath = path.join(artifacts, 'browser-roundtrip.json'); await download.saveAs(exportPath);
+  const exportPath = path.join(artifacts, 'browser-roundtrip.json'); await saveItemDownloadAndProjectSnapshot(download, page, exportPath);
   const payload = JSON.parse(fs.readFileSync(exportPath, 'utf8'));
   const normalized = parseResults(payload);
   assert.equal(normalized.records.video_demo_1.status, 'complete');
@@ -134,7 +135,7 @@ try {
   assert.equal(await page.locator('#export-result').isEnabled(), true);
   check('cancelled file picker does not report a saved file or disable retry');
   const [explicitDownload] = await Promise.all([page.waitForEvent('download'), page.locator('#download-result').click()]);
-  await explicitDownload.saveAs(path.join(artifacts, 'explicit-download.json'));
+  await saveItemDownloadAndProjectSnapshot(explicitDownload, page, path.join(artifacts, 'explicit-download.json'));
   assert.equal(JSON.parse(fs.readFileSync(path.join(artifacts, 'explicit-download.json'), 'utf8')).items[0].segments.length, 2);
   check('explicit browser download works even when native file picker is unavailable');
 
@@ -209,7 +210,7 @@ try {
   assert.equal(await page.locator('#observation').inputValue(), '同一区间的独立观察');
   assert.equal(await page.locator('.timeline-lane').count(), 2);
   const [framesDownload] = await Promise.all([page.waitForEvent('download'), page.locator('#download-result').click()]);
-  const framesPath = path.join(artifacts, 'timeline-frames.json'); await framesDownload.saveAs(framesPath);
+  const framesPath = path.join(artifacts, 'timeline-frames.json'); await saveItemDownloadAndProjectSnapshot(framesDownload, page, framesPath);
   const frames = parseResults(JSON.parse(fs.readFileSync(framesPath, 'utf8'))).records.video_demo_1.segments;
   assert.notEqual(frames[0].id, frames[1].id); assert.equal(frames[0].start_time, frames[1].start_time);
   assert.equal(frames[0].end_time, frames[1].end_time);
@@ -259,7 +260,7 @@ try {
   assert.equal(atRight.end, 12);
   assert.ok(Math.abs(atRight.end - atRight.start - (afterEnd.end - afterEnd.start)) < .003);
   const [editedDownload] = await Promise.all([page.waitForEvent('download'), page.locator('#download-result').click()]);
-  const editedPath = path.join(artifacts, 'timeline-edited.json'); await editedDownload.saveAs(editedPath);
+  const editedPath = path.join(artifacts, 'timeline-edited.json'); await saveItemDownloadAndProjectSnapshot(editedDownload, page, editedPath);
   const editedFrames = parseResults(JSON.parse(fs.readFileSync(editedPath, 'utf8'))).records.video_demo_1.segments;
   assert.ok(Math.abs(editedFrames[0].start_time - atRight.start) < .001); assert.equal(editedFrames[0].end_time, 12);
   assert.equal(editedFrames[1].start_time, frames[1].start_time); assert.equal(editedFrames[1].end_time, frames[1].end_time);
@@ -351,7 +352,7 @@ try {
   await makeSegment('audio', .5, 2, 'MP3 独立导入后可标注');
   await page.locator('#complete-item').click();
   const [mp3Download] = await Promise.all([page.waitForEvent('download'), page.locator('#download-result').click()]);
-  const mp3Result = path.join(artifacts, 'direct-mp3.json'); await mp3Download.saveAs(mp3Result);
+  const mp3Result = path.join(artifacts, 'direct-mp3.json'); await saveItemDownloadAndProjectSnapshot(mp3Download, page, mp3Result);
   const mp3Export = JSON.parse(fs.readFileSync(mp3Result, 'utf8'));
   const audioExport = mp3Export.items.find(i => i.id === 'tone.mp3');
   assert.equal(audioExport.media_type, 'audio'); assert.equal(audioExport.status, 'complete');
@@ -380,7 +381,7 @@ try {
   await makeSegment('audio', .5, 2, '混合队列中的音频标注');
   await page.locator('#complete-item').click();
   const [mixedDownload] = await Promise.all([page.waitForEvent('download'), page.locator('#download-result').click()]);
-  const mixedResult = path.join(artifacts, 'mixed-mp3-mp4.json'); await mixedDownload.saveAs(mixedResult);
+  const mixedResult = path.join(artifacts, 'mixed-mp3-mp4.json'); await saveItemDownloadAndProjectSnapshot(mixedDownload, page, mixedResult);
   const mixedExport = JSON.parse(fs.readFileSync(mixedResult, 'utf8'));
   assert.ok(mixedExport.items.filter(i => i.id === 'tone.mp3' || i.id === 'video_demo_1').every(i => i.status === 'complete' && i.segments.length >= 1));
   assert.equal(mixedExport.items.length, previousCount + 1);
@@ -397,7 +398,7 @@ try {
   page.once('dialog', dialog => dialog.accept()); await page.locator('#delete-task').click();
   await page.waitForFunction(count => document.querySelectorAll('.task-item').length === count, previousCount);
   const [removedDownload] = await Promise.all([page.waitForEvent('download'), page.locator('#download-result').click()]);
-  const removedPath = path.join(artifacts, 'task-removed.json'); await removedDownload.saveAs(removedPath);
+  const removedPath = path.join(artifacts, 'task-removed.json'); await saveItemDownloadAndProjectSnapshot(removedDownload, page, removedPath);
   const removed = JSON.parse(fs.readFileSync(removedPath, 'utf8'));
   assert.equal(removed.items.some(i => i.id === 'video_demo_1'), false);
   assert.ok(removed.items.find(i => i.id === 'tone.mp3').segments.length >= 1);

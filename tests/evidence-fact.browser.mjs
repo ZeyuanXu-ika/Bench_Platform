@@ -1,3 +1,4 @@
+import { saveItemDownloadAndProjectSnapshot } from './project-snapshot.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -49,8 +50,8 @@ async function load(data) {
 }
 async function download(name) {
   const [download] = await Promise.all([page.waitForEvent('download'), page.locator('#download-result').click()]);
-  const target = path.join(artifacts, `evidence-fact-${name}.json`); await download.saveAs(target);
-  const data = JSON.parse(fs.readFileSync(target, 'utf8')); parseResults(data); return data;
+  const target = path.join(artifacts, `evidence-fact-${name}.json`); const project = await saveItemDownloadAndProjectSnapshot(download, page, target);
+  const data = project; parseResults(data); return data;
 }
 async function saveEvidence() {
   await page.locator('#build-fact').click();
@@ -92,7 +93,7 @@ try {
   const subjectA = await createSubject('甲（递交材料的人）'), subjectB = await createSubject('乙（接收材料的人）');
   assert.deepEqual(new Set(await checkedSubjects()), new Set([subjectA, subjectB]));
   await page.locator('#observation').fill('甲把材料递给乙，乙接过材料。');
-  await page.locator('#evidence-fact-review').selectOption('confirmed');
+
   await saveEvidence();
   const first = await download('first'); const record = first.items[0].segments[0];
   const fact = first.graph.facts.find(entry => entry.id === record.annotations.fact_id);
@@ -114,20 +115,20 @@ try {
 
   await stage('events'); await choose('g-event-facts', fact.id);
   await page.locator('#g-event-subjects').selectOption([subjectA, subjectB]);
-  await page.locator('#g-event-title').fill('甲向乙递交材料'); await page.locator('#g-event-review').selectOption('confirmed');
+  await page.locator('#g-event-title').fill('甲向乙递交材料');
   await saveGraph('保存复合事件');
   let layered = await download('event'); const event = layered.graph.events[0];
   assert.deepEqual(new Set(event.subject_ids), new Set([subjectA, subjectB]));
   await stage('emotions'); await choose('g-state-facts', fact.id); await page.locator('#g-state-subject').selectOption(subjectA);
   await choose('g-state-events', event.id); await page.locator('#g-state-label').fill('平静');
   await page.locator('#g-state-start').fill('1'); await page.locator('#g-state-end').fill('3');
-  await page.locator('#g-state-review').selectOption('confirmed'); await saveGraph('保存情感状态');
+  await saveGraph('保存情感状态');
   layered = await download('state'); const state = layered.graph.emotion_states[0]; assert.equal(state.subject_id, subjectA);
   check('compound events and emotion states directly reference the fact produced beside the evidence and inherit its selected subjects');
 
   await stage('evidence'); await page.locator('.segment-row').first().click();
   await page.locator('#observation').fill('甲把两份材料递给乙，乙接过材料。');
-  await page.locator('#evidence-fact-review').selectOption('confirmed'); await saveEvidence();
+  await saveEvidence();
   const updated = await download('updated');
   assert.equal(updated.graph.facts.length, 1); assert.equal(updated.graph.facts[0].id, fact.id);
   assert.equal(updated.graph.facts[0].text, '甲把两份材料递给乙，乙接过材料。');

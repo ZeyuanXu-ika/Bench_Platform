@@ -1,5 +1,6 @@
-const CACHE = 'bench-platform-code-v2.3';
+const CACHE = 'bench-platform-code-v0.9.0';
 const FILES = ['./', './index.html', './styles.css', './graph-ui.css', './evidence-editor.css', './app.mjs', './core.mjs', './graph.mjs', './graph-view.mjs', './subject-lineage.mjs', './evidence-fact.mjs', './evidence-editor.mjs', './graph-ui.mjs', './storage.mjs', './favicon.svg', './README.md'];
+FILES.push('./annotation-timeline.mjs','./material-scope.mjs','./material-results.mjs');
 const ALLOWED = new Set(FILES.map(x => new URL(x, self.registration.scope).pathname));
 self.addEventListener('install', event => {
   event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(FILES)).then(() => self.skipWaiting()));

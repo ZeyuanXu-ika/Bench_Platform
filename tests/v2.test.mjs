@@ -43,6 +43,38 @@ test('v2 export and import preserve the four layers and stable evidence referenc
   assert.equal(graphIssues(restored).filter(issue => issue.severity === 'error').length, 0);
 });
 
+test('state causal notes and direct state change edges roundtrip without rewriting historical transitions', () => {
+  const ws = workspace(); ws.graph = graph(ws);
+  ws.graph.links.push({ id: 'state-cause', from_type: 'event', from_id: 'E1', to_type: 'emotion_state', to_id: 'S2', type: 'causes', note: '人工确认的该事件专属依据' },
+    { id: 'state-change', from_type: 'emotion_state', from_id: 'S1', to_type: 'emotion_state', to_id: 'S2', type: 'transitions_to' });
+  const output = makeExport(ws), restored = parseResults(output);
+  assert.deepEqual(restored.graph, output.graph);
+  assert.deepEqual(restored.graph.emotion_transitions, ws.graph.emotion_transitions);
+  assert.equal(restored.graph.links.find(link => link.id === 'state-cause').note, '人工确认的该事件专属依据');
+});
+
+test('derived event times survive roundtrip, ignore stale imported values and support old exports', () => {
+  const ws = workspace(); ws.graph = graph(ws);
+  ws.records.video.segments[1].start_time = 3; ws.records.video.segments[1].end_time = 4;
+  ws.graph.emotion_states[1].end_time=14;
+  const result = makeExport(ws);
+  assert.deepEqual(result.derived.event_time_ranges.E1, { status: 'derived', timeline_id: 'scene', time_ranges: [{ start_time: 10, end_time: 11 }, { start_time: 13, end_time: 14 }] });
+  assert.deepEqual(makeExport(parseResults(result)).derived, result.derived);
+  result.derived.event_time_ranges.E1.time_ranges = [{ start_time: -999, end_time: 999 }];
+  assert.deepEqual(makeExport(parseResults(result)).derived, makeExport(ws).derived);
+  delete result.derived;
+  assert.deepEqual(makeExport(parseResults(result)).derived, makeExport(ws).derived);
+  ws.graph.links = ws.graph.links.filter(l => l.id !== 'L2');
+  assert.equal(makeExport(ws).derived.event_time_ranges.E1.status, 'unresolved');
+});
+
+test('fact occurrence explanations and evidence presentation roundtrip with a derived event union',()=>{
+  const ws=workspace();ws.graph=graph(ws);const records=structuredClone(ws.records);
+  ws.graph.emotion_states[0].end_time=13.5;ws.graph.emotion_states[1].end_time=14;
+  Object.assign(ws.graph.facts[0],{timeline_id:'scene',time_ranges:[{start_time:12,end_time:13.5}],time_note:'Later evidence recounts earlier content'});ws.graph.events[0].time_ranges=[{start_time:100,end_time:200}];
+  const exported=makeExport(ws),restored=parseResults(exported);assert.equal(restored.graph.events[0].time_ranges,undefined);assert.equal(exported.derived.event_time_ranges.E1.status,'derived');assert.equal(restored.graph.facts[0].time_note,ws.graph.facts[0].time_note);assert.deepEqual(exported.derived.fact_temporal.F1.occurrence.time_ranges,[{start_time:12,end_time:13.5}]);assert.deepEqual(exported.derived.fact_temporal.F1.evidence_presentation.time_ranges,[{start_time:10,end_time:11}]);assert.deepEqual(exported.derived.event_time_ranges.E1.time_ranges,[{start_time:11,end_time:13.5}]);assert.deepEqual(ws.records,records);assert.deepEqual(makeExport(restored).derived,exported.derived);
+});
+
 test('legacy v1 data migrates to reviewable facts without replacing time-window IDs', () => {
   const source = makeExport(workspace()); source.schema_version = '1.0'; delete source.graph;
   const ws = parseResults(source);

@@ -1,28 +1,44 @@
-import { blankGraph, evidenceNodes, evidenceBounds, normalizeGraph, graphIssues, invalidateEvidence, removeGraphNode } from './graph.mjs';
-import { graphViewLinks, projectGraphView, serializeFullGraphSVG } from './graph-view.mjs';
+import { blankGraph, evidenceNodes, evidenceBounds, evidenceTimeRanges, factTimeRanges, eventTimeRanges, normalizeGraph, invalidateEvidence, removeGraphNode, connectEmotionStateSelection, nextAnnotationId, assertTemporalOrder } from './graph.mjs';
+import { annotationNodePresentation, fourLayerTimeline, serializeTimelineSVG, FACT_COLORS } from './graph-view.mjs';
 import { createSubjectResolver } from './subject-lineage.mjs';
 import { setEvidenceSubjects } from './evidence-fact.mjs';
+import { createAnnotationTimeline, planAnnotationTimeEdit, applyAnnotationTimePlan, createAnnotationDraft } from './annotation-timeline.mjs';
+import { materialGraph, materialWorkspace } from './material-scope.mjs';
 
-const STAGES = [['evidence', '证据与事实'], ['facts', '事实汇总'], ['events', '复合事件'], ['emotions', '情感脉络'], ['graph', '关联图谱']];
-const COLLECTION = { entity: 'entities', mention: 'mentions', fact: 'facts', event: 'events', emotion_state: 'emotion_states', emotion_transition: 'emotion_transitions' };
-const TYPE_NAME = { evidence: '证据', entity: '主体', mention: '提及', fact: '事实', event: '复合事件', emotion_state: '情感状态', emotion_transition: '情感变化' };
-const RELATION_NAME = { supports: '支持', constitutes: '构成', grounds: '情感判断依据', associated_with: '关联', causes: '导致（人工判断）' };
-const REVIEW_NAME = { draft: '草稿', needs_review: '待复核', confirmed: '已人工确认' };
+const STAGES = [['evidence', '证据'], ['facts', '事实'], ['events', '复合事件'], ['emotions', '情感脉络'], ['graph', '关联图谱']];
+const COLLECTION = { entity: 'entities', mention: 'mentions', fact: 'facts', event: 'events', emotion_state: 'emotion_states', emotion_transition: 'emotion_transitions', link:'links' };
+const TYPE_NAME = { link:'关系', evidence: '证据', entity: '主体', mention: '提及', fact: '事实', event: '复合事件', emotion_state: '情感状态', emotion_transition: '情感变化' };
+const RELATION_NAME = { supports: '支持', constitutes: '构成', grounds: '情感判断依据', associated_with: '关联', causes: '导致（人工判断）', transitions_to: '情感变化' };
 const node = (tag, className, content) => { const value = document.createElement(tag); if (className) value.className = className; if (content !== undefined) value.textContent = content; return value; };
-const button = (text, action, className = 'g-button') => { const value = node('button', className, text); value.type = 'button'; value.addEventListener('click', action); return value; };
+export function uiIcon(name){const icon=document.createElementNS('http://www.w3.org/2000/svg','svg'),use=document.createElementNS('http://www.w3.org/2000/svg','use');icon.classList.add('ui-icon');icon.setAttribute('aria-hidden','true');icon.setAttribute('focusable','false');use.setAttribute('href',`#icon-${name}`);icon.append(use);return icon;}
+const button = (text, action, className = 'g-button') => { const value = node('button', className, text); value.type = 'button';const name=text==='撤回'?'undo':/^(新增|新建)/.test(text)?'plus':/^保存/.test(text)?'save':text==='连接选中状态'?'link':/^删除/.test(text)?'trash':text==='回放'?'play':null;if(name)value.prepend(uiIcon(name)); value.addEventListener('click', action); return value; };
 const short = (text, length = 55) => String(text || '').length > length ? String(text).slice(0, length) + '…' : String(text || '');
 const numberText = value => Number.isFinite(value) ? `${Math.round(value * 1000) / 1000}s` : '—';
 const rangeText = value => value ? `${numberText(value.start_time)} → ${numberText(value.end_time)}` : '尚未关联时间范围';
 
-export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvidence, onFactSaved }) {
+export function mountGraphWorkbench(root, { getWorkspace, changed, persistDraft, deleteEvidence, navigateEvidence, onFactSaved, seekTimeline, getPlaybackTime, pausePlayback, canUndo, onUndo }) {
   root.classList.add('graph-workbench');
   let activeStage = 'evidence';
-  let graphFit = true;
   let graphPage = 0;
   const selected = { entity: '', mention: '', fact: '', event: '', emotion_state: '', emotion_transition: '' };
-  let factSeed = null, graphFocus = null, showManagement = false;
+  const stateSelection = new Set();
+  let selectedEmotionEdge='';
+  let factSeed = null, graphFocus = null, graphTimeline = null, graphRange = 'full', graphSearch = '', graphListScroll = 0, graphCategory = 'evidence', graphWindowStart = null, graphWindowSpan = 60, graphPanFrame = 0;
+  let graphReferenceID=null,referenceDeletion=null;
+  let graphTypographyObserver=null;
+  let layerTimeline = null;
+  const timelineViews = { facts: {}, events: {}, emotions: {} };
   let subjectWorkspace = null, subjects = null;
   const fieldDrafts = new Map(), fieldBaselines = new Map(), dirtyFields = new Set(); let renderedContext = null, savingContext = null;
+  let autoTimer=null,autoSaving=false,draftWorkspace=null;
+  const temporalConflicts = new Map();
+  function storeFormDrafts(){if(!ws())return;ws().ui_form_drafts=[...dirtyFields].filter(key=>JSON.parse(key)[0]===ws().id).map(key=>[key,fieldDrafts.get(key),fieldBaselines.get(key)]);ws().ui_temporal_conflicts=[...temporalConflicts].map(([key,entry])=>[key,{itemID:entry.itemID,message:entry.error.message}]);}
+  function retainDrafts(){captureFields();storeFormDrafts();if(ws()){ws().updated_at=new Date().toISOString();persistDraft?.();}}
+  function autosave(){clearTimeout(autoTimer);retainDrafts();const save=body.querySelector('.g-actions .primary');const dirtyHere=renderedContext && [...body.querySelectorAll('input[id],select[id],textarea[id]')].some(element=>!element.dataset.graphFilter && dirtyFields.has(draftKey(element,renderedContext)));const conflictType={facts:'fact',events:'event',emotions:'emotion_state'}[activeStage];const retryConflict=conflictType&&temporalConflicts.has(JSON.stringify([ws().id,conflictType,selected[conflictType]||'']));if(!save || (!dirtyHere&&!retryConflict))return;
+    const active=document.activeElement, id=active?.id,start=active?.selectionStart,end=active?.selectionEnd;
+    autoSaving=true;try{save.click();}finally{autoSaving=false;storeFormDrafts();persistDraft?.();}
+    const target=id && document.getElementById(id);if(target){target.focus({preventScroll:true});if(typeof start==='number' && target.setSelectionRange)try{target.setSelectionRange(start,end);}catch{}}
+  }
   const controlSignature = element => JSON.stringify(element.multiple ? [...element.selectedOptions].map(option => option.value) : element.value);
   function draftKey(element, context) {
     const prefix = element.id.startsWith('g-fact-') ? 'fact' : element.id.startsWith('g-event-') ? 'event' : element.id.startsWith('g-state-') ? 'emotion_state' : element.id.startsWith('g-transition-') ? 'emotion_transition' : element.id.startsWith('g-entity-') ? 'entity' : element.id.startsWith('g-mention-') ? 'mention' : 'alignment';
@@ -31,6 +47,8 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
   function captureFields() {
     if (!renderedContext) return;
     for (const element of body.querySelectorAll('input[id],select[id],textarea[id]')) {
+      if(element.closest('.g-state-edge-list'))continue;
+      if (element.type === 'hidden' && element.id.endsWith('-review')) continue;
       const key = draftKey(element, renderedContext), current = element.multiple ? [...element.selectedOptions].map(option => option.value) : element.value;
       fieldDrafts.set(key, current);
       if (element.dataset.graphFilter || !fieldBaselines.has(key)) continue;
@@ -46,6 +64,8 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
   }
   function recordBaselines(context) {
     for (const element of body.querySelectorAll('input[id],select[id],textarea[id]')) {
+      if(element.closest('.g-state-edge-list'))continue;
+      if (element.type === 'hidden' && element.id.endsWith('-review')) continue;
       if (element.dataset.graphFilter) continue;
       const key = draftKey(element, context);
       let baseline = element.multiple ? [...element.selectedOptions].map(option => option.value) : element.value;
@@ -66,6 +86,7 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
   }
   function restoreFields(context) {
     for (const element of body.querySelectorAll('input[id],select[id],textarea[id]')) {
+      if(element.closest('.g-state-edge-list'))continue;
       const key = draftKey(element, context); let saved = fieldDrafts.get(key);
       if (saved === undefined || (!element.dataset.graphFilter && !dirtyFields.has(key))) continue;
       if (element.matches('select') && element.closest('.g-subject-lineage')) {
@@ -82,23 +103,35 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
     }
   }
   const heading = node('div', 'g-heading');
-  heading.append(node('strong', '', '四层标注工作台'));
-  const unsavedNote = node('span', 'g-unsaved-note', '表单尚未保存'); unsavedNote.hidden = true; heading.append(unsavedNote);
-  const status = node('span', 'g-status'); heading.append(status);
+  const unsavedNote = node('span', 'g-unsaved-note', '内容已自动保留为草稿'); unsavedNote.hidden = true; heading.append(unsavedNote);
+  const status = node('span', 'g-status');
+  const undoButton = button('撤回', () => onUndo?.(), 'g-button small'); undoButton.id = 'g-undo'; undoButton.title = '撤回上一步标注修改（Ctrl+Z；输入框内保留文字撤销）'; heading.append(undoButton);
   const tabs = node('nav', 'g-tabs'); tabs.setAttribute('aria-label', '标注阶段');
   const feedback = node('p', 'g-feedback'); feedback.setAttribute('role', 'status'); feedback.hidden = true;
   const body = node('div', 'g-body');
-  root.replaceChildren(heading, tabs, feedback, body);
-  const observeFields = () => { captureFields(); updateUnsavedNote(); };
+  const layerView = node('div', 'g-layer-view'); layerView.hidden = true;
+  const previewHost = node('div', 'g-layer-preview'), timelineHost = node('div', 'g-layer-timeline-host');
+  layerView.append(previewHost, timelineHost);
+  root.replaceChildren(heading, tabs, feedback, layerView, body);
+  for (const media of document.querySelectorAll('#video,#audio')) {
+    for (const event of ['timeupdate', 'seeked', 'loadedmetadata']) media.addEventListener(event, () => layerTimeline?.updatePlayhead());
+  }
+  const observeFields = event => { if(event?.target?.closest('.g-state-edge-list'))return;captureFields(); updateUnsavedNote();if(event?.target?.dataset.graphFilter || activeStage==='graph')return;retainDrafts();clearTimeout(autoTimer);autoTimer=setTimeout(autosave,650); };
   root.addEventListener('input', observeFields); root.addEventListener('change', observeFields);
   root.addEventListener('click', () => queueMicrotask(observeFields));
   const ws = () => getWorkspace();
   const graph = () => ws().graph;
-  const evidence = () => evidenceNodes(ws());
-  const find = (type, id) => type === 'evidence' ? evidence().find(value => value.id === id) : (graph()[COLLECTION[type]] || []).find(value => value.id === id);
+  const visibleGraph = () => materialGraph(ws(),currentItemID());
+  const evidence = () => evidenceNodes(materialWorkspace(ws()));
+  const find = (type, id) => type === 'evidence' ? evidence().find(value => value.id === id) : (visibleGraph()[COLLECTION[type]] || []).find(value => value.id === id);
   const values = id => [...root.querySelectorAll(`#${id} option:checked`)].map(option => option.value);
   const value = id => root.querySelector(`#${id}`)?.value || '';
-  const report = (text, error = false) => { feedback.textContent = text; feedback.hidden = !text; feedback.classList.toggle('error', error); };
+  const report = (text, error = false, temporal = false) => { if(autoSaving && error && !temporal){feedback.textContent='内容已自动保存为草稿，填写完整后自动更新标注。';feedback.hidden=false;feedback.classList.remove('error');return;}feedback.textContent = text; feedback.hidden = !text; feedback.classList.toggle('error', error); };
+  const seekFromTimeline = (timeline, time) => {
+    const result = seekTimeline?.(timeline, time);
+    if (result === false) report('当前素材不覆盖该时间位置；可通过条目中的支持证据回看对应素材。');
+    return result;
+  };
   const linksTo = (toType, toID, fromType) => graph().links.filter(link => link.to_type === toType && link.to_id === toID && (!fromType || link.from_type === fromType));
   const entityName = id => find('entity', id)?.name || id || '未指定主体';
   const currentItemID = () => ws()?.manifest.items[ws().index || 0]?.id || '';
@@ -114,7 +147,7 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
   }
   const savedSubjects = ids => (ids || []).flatMap(id => { const entity = find('entity', id); return entity ? [{ ...entity, evidence_ids: [], pending: false }] : []; });
   const MODALITY_NAME = { visual_observation: '视觉观察', speech_content: '言语内容', acoustic_observation: '声学观察', other: '其他证据', unclassified: '待分类' };
-  const evidenceLabel = entry => `${entry.title || entry.item_id} · ${MODALITY_NAME[entry.modality] || '证据'} · 局部 ${numberText(entry.start_time)}–${numberText(entry.end_time)} · 共同 ${numberText(entry.global_start_time)}–${numberText(entry.global_end_time)} @ ${entry.timeline_id}`;
+  const evidenceLabel = entry => {const display=annotationNodePresentation(ws(),'evidence',entry);return `${display.id} · ${display.content} · ${numberText(entry.start_time)}–${numberText(entry.end_time)}`;};
   function labelFor(type, id) {
     const entry = find(type, id);
     if (!entry) return `已失效的${TYPE_NAME[type] || type}`;
@@ -132,7 +165,7 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
     const caption = node('span', 'g-field-label', text);
     if (grouped) { caption.id = `${element.dataset.controlId}-caption`; label.setAttribute('role', 'group'); label.setAttribute('aria-labelledby', caption.id); }
     label.append(caption, element);
-    if (hint) label.append(node('small', 'g-hint', hint));
+    if (hint) element.title = hint;
     return label;
   }
   function input(id, initial = '', type = 'text') {
@@ -164,9 +197,19 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
       list.replaceChildren();
       for (const option of matches.slice(0, 200)) {
         const card = node('div', 'g-choice-card');
+        if(['g-fact-evidence','g-event-facts','g-state-facts','g-state-events'].includes(id)){
+          card.tabIndex=0;card.dataset.referenceId=option.value;card.dataset.referenceControl=id;
+          const context=()=>JSON.stringify([ws().id,activeStage,selected[activeStage==='facts'?'fact':activeStage==='events'?'event':'emotion_state']||'',currentItemID()]);
+          const selectReference=()=>{if(!optionNodes.get(option.value).selected)return;referenceDeletion={control:id,id:option.value,context:context()};for(const other of root.querySelectorAll('.g-selected-reference'))other.classList.remove('g-selected-reference');card.classList.add('g-selected-reference');};
+          if(referenceDeletion?.control===id && referenceDeletion.id===option.value && referenceDeletion.context===context())card.classList.add('g-selected-reference');
+          card.addEventListener('click',event=>{if(event.target.closest('button,input')||!optionNodes.get(option.value).selected)return;event.preventDefault();selectReference();card.focus({preventScroll:true});},true);
+          card.addEventListener('keydown',event=>{if((event.key==='Enter'||event.key===' ') && event.target===card){event.preventDefault();selectReference();}});
+          card.title='已勾选的上级可再次点击选中关联，退格仅解除这一条关联';
+        }
         const label = node('label', 'g-choice-check'), checkbox = node('input'); checkbox.type = 'checkbox'; checkbox.value = option.value;
         checkbox.setAttribute('aria-label', short(option.title || option.label, 200));
         const description = node('span', 'g-choice-description'); description.append(node('strong', '', short(option.title || option.label, 180)));
+        if (option.content) description.append(node('span', 'g-choice-content', option.content));
         if (option.meta) description.append(node('small', '', option.meta));
         label.append(checkbox, description); card.append(label);
         if (option.kind === 'evidence') card.append(button('回放', () => playEvidence(option.value), 'g-link g-choice-replay'));
@@ -188,35 +231,42 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
     element.addEventListener('input', sync); element.addEventListener('change', sync); element.addEventListener('graph:sync-options', sync);
     picker.append(element, header, search, list, notice); renderCards(); return picker;
   }
-  const entityOptions = () => graph().entities.map(entry => ({ value: entry.id, label: entry.name }));
-  function inheritedSubject(id, candidatesFor, initial = [], { multiple = false, source = '证据', preserve = false } = {}) {
+  const entityOptions = () => visibleGraph().entities.map(entry => ({ value: entry.id, label: entry.name }));
+  function inheritedSubject(id, candidatesFor, initial = [], { multiple = false, source = '证据', preserve = false, showIDs = false } = {}) {
     const wrapper = node('div', 'g-subject-lineage'); wrapper.dataset.controlId = id;
-    const controlHost = node('div', 'g-subject-control'), summary = node('div', 'g-inherited-subject'), hint = node('p', 'g-hint');
-    wrapper.append(summary, controlHost, hint);
+    const controlHost = node('div', 'g-subject-control'), summary = node('div', 'g-inherited-subject');
+    wrapper.append(summary, controlHost);
     let candidates = [], current = [...initial], keepSaved = preserve;
-    const available = () => mergeSubjects(candidatesFor(), keepSaved ? savedSubjects(initial) : []);
+    const available = () => mergeSubjects(mergeSubjects(candidatesFor(), savedSubjects(visibleGraph().entities.map(e=>e.id))), keepSaved ? savedSubjects(initial) : []);
     const read = () => { const control = wrapper.querySelector(`#${id}`); return !control ? [] : multiple ? [...control.selectedOptions].map(option => option.value) : control.value ? [control.value] : []; };
     function paint() {
       candidates = available();
       const allowed = new Set(candidates.map(candidate => candidate.id));
       current = current.filter(id => allowed.has(id));
-      if (!current.length && candidates.length === 1 && (!keepSaved || !initial.length)) current = [candidates[0].id];
-      const options = candidates.map(candidate => ({ value: candidate.id, label: candidate.name, meta: `沿用${source}中标注的主体` }));
+      if (!current.length && candidates.length === 1 && (!keepSaved || !initial.length) && !wrapper.dataset.allowEmpty) current = [candidates[0].id];
+      const options = candidates.map(candidate => ({ value: candidate.id, label: showIDs ? `${candidate.name} · ${candidate.id}` : candidate.name }));
       const selector = select(id, multiple ? options : [{ value: '', label: candidates.length ? '选择本条对应的主体' : '尚无已标主体' }, ...options], multiple ? current : current[0] || '', multiple);
       const control = multiple ? selector.querySelector('select') : selector;
       control.classList.add('g-subject-input');
       controlHost.replaceChildren(selector);
-      const single = candidates.length === 1;
+      const single = candidates.length === 1 && current.length === 1;
       wrapper.classList.toggle('is-single', single); wrapper.classList.toggle('is-empty', !candidates.length);
       if (!multiple) { control.tabIndex = single || !candidates.length ? -1 : 0; control.setAttribute('aria-hidden', String(single || !candidates.length)); }
       summary.replaceChildren();
-      if (single) { summary.append(node('strong', '', candidates[0].name), node('span', '', `沿用${source}主体`)); }
+      if (single) { summary.append(node('strong', '', showIDs ? `${candidates[0].name} · ${candidates[0].id}` : candidates[0].name)); }
       summary.hidden = !single;
-      hint.textContent = !candidates.length ? `请先在${source}中标注主体；此处不会预设人物。` : single ? '已自动带入，无需重复选择。' : `仅显示${source}中的主体，请确认本条对应的对象。`;
+
       control.addEventListener('change', () => { current = read(); });
       return control;
     }
     paint();
+    const nameInput=input(`${id}-name`);nameInput.placeholder='名字 + 回车';nameInput.title='回车添加；空输入框中按退格移除最后一个主体';nameInput.setAttribute('aria-label','输入新主体名字');wrapper.append(nameInput);
+    nameInput.addEventListener('keydown',event=>{
+      if(event.isComposing)return;
+      if(event.key==='Enter'){event.preventDefault();const name=nameInput.value.trim();if(!name || name.length>500)return;let entity=visibleGraph().entities.find(entity=>entity.name===name);if(!entity){entity={id:nextAnnotationId(ws(),'entity'),name,aliases:[],item_id:currentItemID()};graph().entities.push(entity);graph().status='draft';}
+        current=multiple?[...new Set([...read(),entity.id])]:[entity.id];nameInput.value='';const control=paint();control.dispatchEvent(new Event('change',{bubbles:true}));
+      }else if(event.key==='Backspace' && !nameInput.value){event.preventDefault();current=read().slice(0,-1);wrapper.dataset.allowEmpty='true';const control=paint();control.dispatchEvent(new Event('change',{bubbles:true}));}
+    });
     wrapper.refreshSubjects = (notify = false) => {
       const previous = JSON.stringify(read()); current = read();
       if (notify) keepSaved = false;
@@ -232,12 +282,12 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
     };
     return wrapper;
   }
-  const factOptions = () => graph().facts.map(entry => ({ value: entry.id, label: short(entry.text, 85), title: entry.text || '未填写事实', meta: `${entry.subject_ids.map(entityName).join('、') || '未指定主体'} · ${REVIEW_NAME[entry.review_status] || '草稿'}` }));
-  const eventOptions = () => graph().events.map(entry => ({ value: entry.id, label: entry.title, title: entry.title, meta: `${entry.subject_ids.map(entityName).join('、')} · ${REVIEW_NAME[entry.review_status] || '草稿'}` }));
-  const evidenceOptions = () => evidence().map(entry => ({ value: entry.id, label: evidenceLabel(entry), kind: 'evidence', title: `${entry.title || entry.item_id} · ${MODALITY_NAME[entry.modality] || '证据'}`, meta: `局部 ${numberText(entry.start_time)}–${numberText(entry.end_time)} · 共同 ${numberText(entry.global_start_time)}–${numberText(entry.global_end_time)} @ ${entry.timeline_id}` }));
+  const factOptions = () => visibleGraph().facts.map(entry => ({ value: entry.id, label: short(entry.text, 85), title: entry.text || '未填写事实', meta: entry.subject_ids.map(entityName).join('、') || '未指定主体' }));
+  const eventOptions = () => visibleGraph().events.map(entry => ({ value: entry.id, label: entry.title, title: entry.title, meta: entry.subject_ids.map(entityName).join('、') }));
+  const evidenceOptions = () => evidence().map(entry => {const display=annotationNodePresentation(ws(),'evidence',entry),shifted=entry.start_time!==entry.global_start_time||entry.end_time!==entry.global_end_time;return {value:entry.id,label:evidenceLabel(entry),kind:'evidence',title:`${display.id} · ${MODALITY_NAME[entry.modality]||'证据'}`,content:display.content,meta:`${numberText(entry.start_time)}–${numberText(entry.end_time)}${shifted?` · 对齐 ${numberText(entry.global_start_time)}–${numberText(entry.global_end_time)}`:''}`};});
   const multipleHint = '';
   function reviewField(prefix, initial = 'needs_review') {
-    return field('复核状态', select(`${prefix}-review`, Object.entries(REVIEW_NAME).map(([id, label]) => ({ value: id, label })), initial));
+    return input(`${prefix}-review`, initial, 'hidden');
   }
   function trackForm(form, prefix) {
     for (const element of form.querySelectorAll('input,select,textarea')) element.dataset.graphTracked = controlSignature(element);
@@ -261,13 +311,14 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
     for (const [key, entries] of Object.entries(value)) {
       if (key === 'status') continue;
       result[key] = entries.map(entry => key === 'links'
-        ? JSON.stringify([entry.from_type, entry.from_id, entry.to_type, entry.to_id, entry.type])
+        ? JSON.stringify([entry.from_type, entry.from_id, entry.to_type, entry.to_id, entry.type, entry.note ?? null,entry.content_influence??null,entry.content_refs??null])
         : nodeSignature(entry, true)).sort();
     }
     return JSON.stringify(result);
   }
-  function changedGraph(mutator, message, context = savingContext) {
+  function changedGraph(mutator, message, context = savingContext, validationContext = context) {
     const workspace = ws(), previous = structuredClone({ graph: workspace.graph, records: workspace.records, manifest: workspace.manifest });
+    const previousSelection = { ...selected }, conflictKey = JSON.stringify([workspace.id, validationContext?.type || activeStage, validationContext?.id || '']);
     try {
       captureFields();
       workspace.graph.status = 'draft'; mutator();
@@ -275,13 +326,48 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
       const modified = graphModified || JSON.stringify(previous.records) !== JSON.stringify(workspace.records) || JSON.stringify(previous.manifest) !== JSON.stringify(workspace.manifest);
       if (!graphModified) workspace.graph.status = previous.graph.status;
       workspace.graph = normalizeGraph(workspace.graph, workspace);
+      assertTemporalOrder(workspace);
+      const clearedConflict=temporalConflicts.delete(conflictKey);
       if (context) clearFormContext(context.type, context.id);
       pruneRemovedContexts(); renderedContext = null;
+      storeFormDrafts();
+      if(clearedConflict&&!modified)persistDraft?.();
       if (modified) Promise.resolve(changed()).catch(error => report(error.message || '浏览器草稿保存失败，请导出结果', true));
-      render(); report(message);
+      render(); const remaining=[...temporalConflicts.values()].find(entry=>entry.itemID===currentItemID());report(remaining?remaining.error.message:message,!!remaining,!!remaining);
       if (['fact', 'mention', 'entity'].includes(context?.type)) onFactSaved?.(context.type === 'fact' ? selected.fact : undefined);
       return true;
-    } catch (error) { workspace.graph = previous.graph; workspace.records = previous.records; workspace.manifest = previous.manifest; report(error.message || '修改未保存，请检查字段', true); return false; }
+    } catch (error) {
+      workspace.graph = previous.graph; workspace.records = previous.records; workspace.manifest = previous.manifest; Object.assign(selected, previousSelection);
+      if (error.code === 'TEMPORAL_ORDER') temporalConflicts.set(conflictKey, { error, itemID: currentItemID() });
+      storeFormDrafts(); persistDraft?.();
+      report(error.message || '修改未保存，请检查字段', true, error.code === 'TEMPORAL_ORDER'); return false;
+    }
+  }
+  function editTimeline(request) {
+    const saved = changedGraph(() => {
+      const plan = planAnnotationTimeEdit(materialWorkspace(ws()), request);
+      applyAnnotationTimePlan(ws(), plan);
+      if (plan.state_updates.length) selected.emotion_state = plan.state_updates[0].id;
+      else selected[request.type] = request.id;
+      // Keep unsaved descriptions while replacing stale time fields for edited states.
+      for (const state of plan.state_updates) for (const key of fieldDrafts.keys()) {
+        const parts = JSON.parse(key);
+        if (parts[1] === 'emotion_state' && parts[2] === state.id && ['g-state-start', 'g-state-end', 'g-state-review'].includes(parts[4])) {
+          fieldDrafts.delete(key); dirtyFields.delete(key); fieldBaselines.delete(key);
+        }
+      }
+      for(const fact of plan.fact_updates)for(const key of fieldDrafts.keys()){
+        const parts=JSON.parse(key);if(parts[1]==='fact'&&parts[2]===fact.id&&(parts[4]==='g-fact-time-mode'||/^g-fact-time-(start|end)-/.test(parts[4]))){fieldDrafts.delete(key);dirtyFields.delete(key);fieldBaselines.delete(key);}
+      }
+    }, request.type === 'event' ? '事件时间已保存，构成事实和证据均保持不变' : request.type === 'fact' ? '事实时间已保存，证据保持不变' : '情感时间框已保存', null, {type:request.type,id:request.id});
+    if (saved) onFactSaved?.();
+  }
+  function createTimelineDraft(stage, timeline, start, end) {
+    const saved = changedGraph(() => {
+      const entry = createAnnotationDraft(ws(), stage, timeline, start, end); selected[entry.type] = entry.id;
+      if (stage === 'facts') factSeed = null;
+    }, stage === 'emotions' ? '已新建情感时间窗，请补充主体、情感以及事实或事件依据' : '已新建时间窗与关联草稿，请补充证据类别、主体和事实描述', null);
+    if (saved) onFactSaved?.();
   }
   function markDependents(type, id) {
     const queue = [[type, id]], seen = new Set();
@@ -300,22 +386,43 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
     const existing = linksTo(toType, toID, fromType), unique = [...new Set(ids)];
     if (sameMembers(existing.map(link => link.from_id), unique) && existing.every(link => link.type === type)) return;
     graph().links = graph().links.filter(link => !(link.to_type === toType && link.to_id === toID && link.from_type === fromType));
-    for (const id of unique) graph().links.push({ id: existing.find(link => link.from_id === id)?.id || crypto.randomUUID(), from_type: fromType, from_id: id, to_type: toType, to_id: toID, type });
+    for (const id of unique) graph().links.push({ id: existing.find(link => link.from_id === id)?.id || nextAnnotationId(ws(), 'link'), from_type: fromType, from_id: id, to_type: toType, to_id: toID, type });
   }
   function upsert(type, entry) {
     const list = graph()[COLLECTION[type]], index = list.findIndex(current => current.id === entry.id);
     if (index >= 0) { if (nodeSignature(list[index], true) !== nodeSignature(entry, true)) list[index] = entry; } else list.push(entry);
     selected[type] = entry.id;
   }
-  function remove(type, id) {
-    if (!id || !window.confirm(`删除这个${TYPE_NAME[type]}及其关联关系？受影响的上层标注将改为待复核。`)) return;
+  function remove(type, id, confirm=true) {
+    if (!id || (confirm && !window.confirm(`删除这个${TYPE_NAME[type]}及其关联关系？`))) return;
     changedGraph(() => { removeGraphNode(ws(), COLLECTION[type], id); selected[type] = ''; }, `已删除${TYPE_NAME[type]}，关联关系已清理`, { type, id });
   }
-  function stage(name) { captureFields(); activeStage = name; if (name === 'graph') showManagement = false; feedback.hidden = true; render(); }
+  function stage(name) { autosave(); referenceDeletion=null;graphReferenceID=null;activeStage = name; feedback.hidden = true; render(); }
+  function toggleStateSelection(id) {
+    if (!find('emotion_state', id)) return;
+    if (stateSelection.has(id)) stateSelection.delete(id); else stateSelection.add(id);
+    render();
+  }
+  function selectionTools({compact=false}={}) {
+    const tools = node('section', 'g-state-selection-tools'); tools.setAttribute('aria-label', '情感状态多选连边');
+    tools.classList.toggle('compact',compact);
+    const summary = node('strong', 'g-state-selection-count', `已选择 ${stateSelection.size} 个情感状态`); summary.setAttribute('role', 'status');
+    const connect = button('连接选中状态', () => changedGraph(() => {connectEmotionStateSelection(ws(), [...stateSelection]);selectedEmotionEdge=graph().links.find(link=>link.type==='transitions_to'&&stateSelection.has(link.from_id)&&stateSelection.has(link.to_id))?.id||'';}, '已按时间顺序连接选中状态', null), 'g-button primary'); connect.id = 'g-connect-selected'; connect.disabled = compact ? stateSelection.size!==2 : stateSelection.size<2;
+    tools.append(summary, connect, button('清空多选', () => { stateSelection.clear(); render(); }, 'g-button'));
+    const labels = node('div', 'g-state-selection-tags');
+    for (const id of stateSelection) labels.append(button(`${labelFor('emotion_state', id)} ×`, () => toggleStateSelection(id), 'g-chip'));
+    if(!compact)tools.append(labels); return tools;
+  }
   function openNode(type, id) {
+    referenceDeletion=null;graphReferenceID=null;
+    if(type==='emotion_state')selectedEmotionEdge='';
     if (type === 'evidence') return playEvidence(id);
+    if (type === 'emotion_transition' || type === 'emotion_relation') {
+      const entry = type === 'emotion_transition' ? find(type, id) : graph().links.find(link => link.id === id);
+      if (entry) { selected.emotion_state = entry.to_state_id || entry.to_id; stage('emotions'); return; }
+    }
     selected[type] = id;
-    if (type === 'entity' || type === 'mention') { showManagement = true; stage('evidence'); return; }
+    if (type === 'entity' || type === 'mention') { stage('evidence'); report('主体在证据与事实中维护；原有证据提及与媒体对齐信息保留在数据中。'); return; }
     stage(type === 'fact' ? 'facts' : type === 'event' ? 'events' : 'emotions');
   }
   async function playEvidence(id) {
@@ -324,16 +431,26 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
     catch (error) { report(error.message || '无法回到证据窗口', true); }
   }
   function nodeList(type, title) {
+    const times = type === 'event' ? eventTimeRanges(ws(), graph()) : {};
+    const entries = visibleGraph()[COLLECTION[type]];
     const sidebar = node('aside', 'g-node-list'); sidebar.dataset.recordType = type;
-    const top = node('div', 'g-list-top'); top.append(node('h3', '', `${title}（${graph()[COLLECTION[type]].length}）`), button(`新增${title}`, () => { selected[type] = ''; if (type === 'fact') factSeed = null; render(); }, 'g-button small'));
+    const top = node('div', 'g-list-top'); top.append(node('h3', '', `${title}（${entries.length}）`), button(`新增${title}`, () => { selected[type] = ''; if (type === 'fact') factSeed = null; render(); }, 'g-button small'));
     sidebar.append(top);
-    if (selected[type]) sidebar.append(button(`删除选中${title}`, () => remove(type, selected[type]), 'g-link danger g-list-remove'));
+    if (selected[type]) sidebar.append(button(type === 'emotion_state' ? '删除当前编辑状态' : `删除选中${title}`, () => remove(type, selected[type]), 'g-link danger g-list-remove'));
     const list = node('div', 'g-node-scroll');
-    for (const entry of graph()[COLLECTION[type]]) {
-      const item = button('', () => { selected[type] = entry.id; if (type === 'fact') factSeed = null; render(); }, 'g-node' + (selected[type] === entry.id ? ' active' : ''));
-      item.dataset.nodeId = entry.id; item.append(node('strong', '', short(labelFor(type, entry.id), 70)));
-      if (entry.review_status) { const badge = node('small', 'g-review-badge', REVIEW_NAME[entry.review_status] || entry.review_status); badge.dataset.review = entry.review_status; item.append(badge); }
-      list.append(item);
+    for (const entry of entries) {
+      const item = button('', () => { referenceDeletion=null;graphReferenceID=null;if (['emotion_state', 'emotion_transition'].includes(type)) return openNode(type, entry.id); selected[type] = entry.id; if (type === 'fact') factSeed = null; render(); }, 'g-node' + (selected[type] === entry.id ? ' active' : ''));
+      const display=annotationNodePresentation(ws(),type,entry);
+      if(type==='fact'){item.dataset.factKind=entry.kind;item.style.setProperty('--node-color',display.color);item.style.borderLeft=`3px solid ${display.color}`;}
+      item.dataset.nodeId = entry.id; item.append(node('strong', '', display.cardHeading),node('span','g-node-description',display.content));
+      item.append(node('small', 'g-node-id', type==='emotion_state'?entry.id:`参与主体：${display.subjects}`));
+      if(display.tag) item.append(node('small','g-node-type-tag',display.tag));
+      if (type === 'event') item.append(node('small', 'g-event-time', times[entry.id].time_ranges.length ? times[entry.id].time_ranges.map(rangeText).join(' ∪ ') : '时间待补充'));
+      if (type === 'emotion_state') {
+        const row = node('div', 'g-state-choice-row'), check = node('input'); check.type = 'checkbox'; check.checked = stateSelection.has(entry.id); check.dataset.stateId = entry.id;
+        check.setAttribute('aria-label', `选择状态用于连边：${labelFor(type, entry.id)}`); check.addEventListener('change', () => toggleStateSelection(entry.id));
+        row.append(check, item); list.append(row);
+      } else list.append(item);
     }
     if (!list.children.length) list.append(node('p', 'g-empty', `尚未创建${title}。`));
     sidebar.append(list); return sidebar;
@@ -347,8 +464,6 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
   function partitionForm(form, type, ids) {
     form.dataset.editorType = type;
     const columns = node('div', 'g-form-columns'), category = node('section', 'g-category-area'), content = node('section', 'g-content-area');
-    category.append(node('h4', 'g-subheading', type === 'fact' ? '类型与主体' : type === 'event' ? '参与主体与复核' : type === 'emotion_state' ? '主体与情感判断' : '主体与状态连接'));
-    content.append(node('h4', 'g-subheading', type === 'fact' ? '事实与证据' : type === 'event' ? '具体事件与组成事实' : type === 'emotion_state' ? '时间与事实依据' : '关联事件与判断依据'));
     const actions = [...form.children].find(child => child.classList.contains('g-actions'));
     for (const id of ids) { const field = form.querySelector(`#${id}`)?.closest('.g-field'); if (field) category.append(field); }
     for (const child of [...form.children]) {
@@ -365,127 +480,61 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
     return list;
   }
   function factEvidence(factIDs) { return [...new Set(graph().links.filter(link => link.from_type === 'evidence' && link.to_type === 'fact' && factIDs.includes(link.to_id)).map(link => link.from_id))]; }
-  function boundsForFacts(ids) { return evidenceBounds(ws(), factEvidence(ids)); }
-
-  function management() {
-    const wrapper = node('details', 'g-management'); wrapper.open = showManagement;
-    wrapper.addEventListener('toggle', () => { showManagement = wrapper.open; });
-    wrapper.append(node('summary', '', '主体、证据提及与媒体对齐'));
-    const columns = node('div', 'g-management-grid');
-    const entities = node('section', 'g-card'); entities.append(node('h3', '', '主体与共指'));
-    entities.append(node('p', 'g-hint', '先建立稳定主体，再把“黄衣人”“说话人 A”等提及指向主体。未知身份保持独立，不会自动合并。'));
-    const entityList = node('div', 'g-chip-list');
-    entityList.append(button('新增主体', () => { selected.entity = ''; render(); }));
-    for (const entry of graph().entities) entityList.append(button(entry.name, () => { selected.entity = entry.id; render(); }, 'g-chip' + (selected.entity === entry.id ? ' active' : '')));
-    const current = find('entity', selected.entity);
-    const name = input('g-entity-name', current?.name), aliases = input('g-entity-aliases', current?.aliases?.join('，'));
-    entities.append(entityList, field('主体名称', name), field('别名 / 已知称呼', aliases, '使用逗号或换行分隔。别名只记录称呼，不据此自动判断身份。'));
-    const entityActions = node('div', 'g-actions');
-    entityActions.append(button('保存主体', () => changedGraph(() => {
-      requireValue(name.value.trim(), '请填写主体名称');
-      const entry = { id: current?.id || crypto.randomUUID(), name: name.value.trim(), aliases: [...new Set(aliases.value.split(/[,，\n]/).map(text => text.trim()).filter(Boolean))] };
-      if (current && nodeSignature(current) !== nodeSignature(entry)) {
-        for (const fact of graph().facts.filter(fact => fact.subject_ids.includes(current.id) || fact.speaker_id === current.id)) { fact.review_status = 'needs_review'; markDependents('fact', fact.id); }
-        for (const state of graph().emotion_states.filter(state => state.subject_id === current.id)) { state.review_status = 'needs_review'; markDependents('emotion_state', state.id); }
-      }
-      upsert('entity', entry);
-    }, '主体已保存', { type: 'entity', id: current?.id || '' }), 'g-button primary'));
-    if (current) entityActions.append(button('删除主体', () => remove('entity', current.id), 'g-button danger'));
-    entities.append(entityActions);
-
-    const mentions = node('section', 'g-card'); mentions.append(node('h3', '', '证据中的主体提及'));
-    const mention = find('mention', selected.mention);
-    mentions.append(field('提及描述', input('g-mention-description', mention?.description || '', 'text')), field('指向主体', select('g-mention-entity', [{ value: '', label: '请选择主体' }, ...entityOptions()], mention?.entity_id || '')), field('提及出现的证据窗', select('g-mention-evidence', [{ value: '', label: '请选择证据' }, ...evidenceOptions()], mention?.evidence_id || '')));
-    const mentionActions = node('div', 'g-actions'); mentionActions.append(button(mention ? '更新提及' : '新增提及', () => changedGraph(() => {
-      requireValue(value('g-mention-description').trim() && value('g-mention-entity') && value('g-mention-evidence'), '请填写提及描述、主体和证据窗');
-      const entry = { id: mention?.id || crypto.randomUUID(), description: value('g-mention-description').trim(), entity_id: value('g-mention-entity'), evidence_id: value('g-mention-evidence') };
-      if (mention && nodeSignature(mention) !== nodeSignature(entry)) for (const fact of graph().facts.filter(fact => fact.subject_ids.includes(mention.entity_id) || fact.subject_ids.includes(entry.entity_id) || fact.speaker_id === mention.entity_id || fact.speaker_id === entry.entity_id)) { fact.review_status = 'needs_review'; markDependents('fact', fact.id); }
-      upsert('mention', entry);
-      if (mention && mention.evidence_id !== entry.evidence_id && !graph().mentions.some(current => current.evidence_id === mention.evidence_id && current.entity_id === mention.entity_id)) {
-        const previousSource = find('evidence', mention.evidence_id);
-        const previousAnnotation = previousSource && ws().records[previousSource.item_id]?.segments.find(segment => segment.id === previousSource.segment_id)?.annotations;
-        if (previousAnnotation && Object.hasOwn(previousAnnotation, 'subject_ids')) setEvidenceSubjects(ws(), previousSource.item_id, previousSource.segment_id, previousAnnotation.subject_ids.filter(id => id !== mention.entity_id));
-      }
-      const evidence = find('evidence', entry.evidence_id);
-      const annotation = evidence && ws().records[evidence.item_id]?.segments.find(segment => segment.id === evidence.segment_id)?.annotations;
-      if (annotation && Object.hasOwn(annotation, 'subject_ids')) {
-        const ids = mention && mention.evidence_id === entry.evidence_id && mention.entity_id !== entry.entity_id
-          ? annotation.subject_ids.map(id => id === mention.entity_id ? entry.entity_id : id)
-          : [...annotation.subject_ids, entry.entity_id];
-        setEvidenceSubjects(ws(), evidence.item_id, evidence.segment_id, [...new Set(ids)]);
-      }
-    }, '主体提及已保存', { type: 'mention', id: mention?.id || '' })));
-    if (mention) mentionActions.append(button('取消编辑', () => { selected.mention = ''; render(); })); mentions.append(mentionActions);
-    const mentionList = node('div', 'g-compact-list');
-    for (const entry of graph().mentions) {
-      const row = node('div', 'g-compact-row');
-      row.append(button(`${entry.description} → ${entityName(entry.entity_id)}`, () => { selected.mention = entry.id; render(); }, 'g-link'), button('回放', () => playEvidence(entry.evidence_id), 'g-link'), button('删除', () => remove('mention', entry.id), 'g-link danger'));
-      mentionList.append(row);
-    }
-    mentions.append(mentionList); columns.append(entities, mentions); wrapper.append(columns);
-
-    const alignment = node('section', 'g-card'); alignment.append(node('h3', '', '共同时间轴与媒体偏移'), node('p', 'g-hint', '共同时间 = 素材内时间 + 偏移秒数。同一次录制的独立音轨、视频应使用相同时间轴 ID。偏移可为负数；修改会使引用这些证据的上层标注待复核。'));
-    const byItem = new Map();
-    for (const entry of evidence()) { if (!byItem.has(entry.item_id)) byItem.set(entry.item_id, []); byItem.get(entry.item_id).push(entry); }
-    for (const [index, item] of ws().manifest.items.entries()) {
-      const row = node('div', 'g-alignment-row');
-      const timeline = input(`g-align-timeline-${index}`, item.timeline_id || item.source_id || item.id), offset = input(`g-align-offset-${index}`, item.time_offset_s ?? item.clip_start_s ?? 0, 'number');
-      timeline.dataset.itemId = item.id; offset.dataset.itemId = item.id;
-      row.append(node('strong', '', item.title), field('时间轴 ID', timeline), field('偏移 / 秒', offset));
-      row.append(button('保存对齐', () => {
-        const before = structuredClone(ws());
-        try {
-          captureFields();
-          requireValue(timeline.value.trim(), '时间轴 ID 不能为空'); requireValue(offset.value !== '' && Number.isFinite(Number(offset.value)), '偏移必须为有效秒数');
-          if (timeline.value.trim() === (item.timeline_id || item.source_id || item.id) && Number(offset.value) === (item.time_offset_s ?? item.clip_start_s ?? 0)) {
-            clearFormContext('alignment', '', item.id); renderedContext = null; render(); report('媒体对齐未变化，已有复核状态保留'); return;
-          }
-          item.timeline_id = timeline.value.trim(); item.time_offset_s = Number(offset.value);
-          graph().status = 'draft'; invalidateEvidence(ws(), evidence().filter(entry => entry.item_id === item.id).map(entry => entry.id));
-          for (const event of graph().events) {
-            const factIDs = linksTo('event', event.id, 'fact').map(link => link.from_id);
-            try { const bounds = boundsForFacts(factIDs); if (bounds) event.timeline_id = bounds.timeline_id; } catch { event.review_status = 'needs_review'; }
-          }
-          ws().graph = normalizeGraph(graph(), ws()); clearFormContext('alignment', '', item.id); renderedContext = null; Promise.resolve(changed()).catch(error => report(error.message, true)); render(); report('媒体对齐已保存，受影响的事实、事件与情感需要复核');
-        } catch (error) {
-          ws().manifest = before.manifest; ws().graph = before.graph; render(); report(error.message || '对齐未保存', true);
-        }
-      }));
-      const windows = byItem.get(item.id) || [];
-      if (windows.length) row.append(node('small', 'g-hint g-align-summary', `共同时间范围：${numberText(Math.min(...windows.map(entry => entry.global_start_time)))} → ${numberText(Math.max(...windows.map(entry => entry.global_end_time)))} · ${windows.length} 个证据窗`));
-      alignment.append(row);
-    }
-    wrapper.append(alignment); return wrapper;
-  }
+  function boundsForFacts(ids) {const times=factTimeRanges(ws()), chosen=ids.map(id=>times[id]);if(!chosen.length||chosen.some(t=>!t?.time_ranges.length))return null;requireValue(chosen.every(t=>t.timeline_id===chosen[0].timeline_id),'所选事实属于不同时间轴');return {timeline_id:chosen[0].timeline_id,start_time:Math.min(...chosen.flatMap(t=>t.time_ranges.map(r=>r.start_time))),end_time:Math.max(...chosen.flatMap(t=>t.time_ranges.map(r=>r.end_time)))};}
 
   function factsPanel() {
     const layout = node('div', 'g-editor-layout'); layout.append(nodeList('fact', '事实'));
     const form = node('div', 'g-card g-form');
     const fact = find('fact', selected.fact), seed = fact ? null : factSeed;
     const refs = fact ? linksTo('fact', fact.id, 'evidence').map(link => link.from_id) : seed?.evidence_ids || [];
-    form.append(node('h3', '', fact ? '编辑事实' : '新增事实'), node('p', 'g-hint', '用第三人称客观描述。例：“A 称 B 已离职”描述的是 A 的陈述，不能直接认定 B 已离职。'));
+    form.append(node('h3', '', fact ? '编辑事实' : '新增事实'));
     form.append(field('客观事实描述', textarea('g-fact-text', fact?.text || seed?.text || '')), field('事实类型', select('g-fact-kind', [{ value: 'observation', label: '观察事实' }, { value: 'reported_speech', label: '人物陈述 / 转述事实' }], fact?.kind || 'observation')));
     const candidateSubjects = () => { const ids = form.querySelector('#g-fact-evidence') ? values('g-fact-evidence') : refs; return ids.length ? subjects.fromEvidence(ids) : taskSubjects(); };
     const subjectField = inheritedSubject('g-fact-subjects', candidateSubjects, fact?.subject_ids || seed?.subject_ids || [], { multiple: true, source: '证据', preserve: !!fact });
     const speakerField = inheritedSubject('g-fact-speaker', candidateSubjects, fact?.speaker_id ? [fact.speaker_id] : [], { source: '证据', preserve: !!fact });
     const pair = node('div', 'g-form-pair'); pair.append(field('事实主体', subjectField), field('发言者（人物陈述）', speakerField, '被描述主体与发言者分别记录；观察事实不保存发言者。')); form.append(pair);
     form.append(field('支持证据', select('g-fact-evidence', evidenceOptions(), refs, true), '可勾选多个已对齐的音视频窗；同一证据可支持不同事实。'), reviewField('g-fact', fact?.review_status));
+    const temporal=node('details','g-fact-temporal'),mode=select('g-fact-time-mode',[{value:'evidence',label:'默认：沿用证据呈现时间'},{value:'independent',label:'单独指定事实发生时间'}],fact?.time_ranges?.length?'independent':'evidence');
+    temporal.open=!!fact?.time_ranges?.length;temporal.append(node('summary','',`事实发生时间 · ${fact?.time_ranges?.length?'单独指定':'沿用证据'}`));
+    const timing=fact?factTimeRanges(ws())[fact.id]:null,ranges=timing?.time_ranges||[],timeControls=[];
+    temporal.append(node('h4','','事实发生时间'),field('时间设置',mode),node('p','g-hint','证据与事实的时间窗可以不同，但证据的结束时间不能晚于事实。'));
+    for(const [index,range] of (ranges.length?ranges:[{start_time:'',end_time:''}]).entries()){
+      const start=input(`g-fact-time-start-${index}`,range.start_time,'number'),end=input(`g-fact-time-end-${index}`,range.end_time,'number'),pair=node('div','g-form-pair');
+      start.disabled=end.disabled=mode.value!=='independent';pair.append(field(`发生起点 ${ranges.length>1?index+1:''} / 秒`,start),field(`发生终点 ${ranges.length>1?index+1:''} / 秒`,end));timeControls.push({start,end});temporal.append(pair);
+    }
+    const timeNote=textarea('g-fact-time-note',fact?.time_note||'',2),timeWarning=node('p','g-temporal-warning'),presentation=node('p','g-derived-time');timeWarning.id='g-fact-time-warning';presentation.id='g-fact-evidence-time';
+    temporal.append(presentation,timeWarning,field('时间说明',timeNote,'发生时间与证据不相交时请说明原因，例如后续回述、回忆或前提证据。'));form.append(temporal);
+    const updateTimeFeedback=()=>{try{
+      const evidenceIDs=values('g-fact-evidence'),bounds=evidenceTimeRanges(ws(),evidenceIDs),windows=evidence().filter(entry=>evidenceIDs.includes(entry.id));
+      presentation.textContent=bounds?`证据呈现时间：${bounds.time_ranges.map(rangeText).join(' ∪ ')}`:'尚未选择支持证据';
+      for(const controls of timeControls){controls.start.disabled=controls.end.disabled=mode.value!=='independent';}
+      const occurrence=timeControls.filter(({start,end})=>start.value!==''&&end.value!=='').map(({start,end})=>({start_time:Number(start.value),end_time:Number(end.value)}));
+      const mismatch=mode.value==='independent'&&occurrence.length&&windows.some(window=>!occurrence.some(range=>range.start_time<window.global_end_time&&range.end_time>window.global_start_time));
+      const latestEnd=occurrence.length?Math.max(...occurrence.map(range=>range.end_time)):null;
+      const late=mode.value==='independent'&&latestEnd!==null&&windows.find(window=>window.global_end_time>latestEnd+1e-6);
+      timeWarning.hidden=!mismatch&&!late;timeWarning.textContent=late?`证据 ${late.segment_id} 的结束时间晚于事实，请调整时间窗或取消该关联后再保存。`:mismatch?(timeNote.value.trim()?'事实与证据时间不相交；已记录说明。':'事实与证据时间不相交，请填写时间说明。'):'';timeNote.required=!!mismatch&&!late;
+    }catch(error){timeWarning.hidden=false;timeWarning.textContent=error.message;}};
+    temporal.addEventListener('input',updateTimeFeedback);temporal.addEventListener('change',updateTimeFeedback);form.querySelector('#g-fact-evidence').addEventListener('change',updateTimeFeedback);queueMicrotask(()=>{if(activeStage==='facts')updateTimeFeedback();});
     form.querySelector('#g-fact-kind').addEventListener('change', () => { speakerField.closest('.g-field').hidden = value('g-fact-kind') !== 'reported_speech'; });
     form.querySelector('#g-fact-evidence').addEventListener('change', () => { subjectField.refreshSubjects(true); speakerField.refreshSubjects(true); });
     trackForm(form, 'g-fact');
     saveActions(form, 'fact', () => changedGraph(() => {
       const text = value('g-fact-text').trim(), subjects = values('g-fact-subjects'), evidenceIDs = values('g-fact-evidence'), kind = value('g-fact-kind'), speaker = value('g-fact-speaker');
-      requireValue(text, '请填写事实描述'); requireValue(subjects.length, '请至少选择一个主体'); requireValue(evidenceIDs.length, '请选择支持事实的证据窗');
-      if (kind === 'reported_speech') requireValue(speaker, '陈述事实必须注明说话主体');
+      if(!autoSaving){requireValue(text, '请填写事实描述'); requireValue(subjects.length, '请至少选择一个主体'); requireValue(evidenceIDs.length, '请选择支持事实的证据窗');
+      if (kind === 'reported_speech') requireValue(speaker, '陈述事实必须注明说话主体');}
       subjectField.commitSubjects(); if (kind === 'reported_speech') speakerField.commitSubjects();
-      const id = fact?.id || crypto.randomUUID(), entry = { id, text, subject_ids: subjects, kind, speaker_id: kind === 'reported_speech' ? speaker : '', review_status: value('g-fact-review') };
+      const id = fact?.id || nextAnnotationId(ws(), 'fact'), entry = { ...(fact || {}), id, text, subject_ids: subjects, kind, speaker_id: kind === 'reported_speech' ? speaker : '', review_status: value('g-fact-review'), ...(fact ? fact.item_id ? { item_id: fact.item_id } : {} : { item_id: currentItemID() }) };
+      entry.time_note=value('g-fact-time-note').trim();
+      if(value('g-fact-time-mode')==='independent'){
+        entry.time_ranges=timeControls.map(({start,end})=>{requireValue(start.value!==''&&end.value!==''&&Number.isFinite(Number(start.value))&&Number.isFinite(Number(end.value))&&Number(end.value)>Number(start.value),'请填写有效的事实发生时间，终点须大于起点');return {start_time:Number(start.value),end_time:Number(end.value)};});
+        entry.timeline_id=fact?.timeline_id||evidenceTimeRanges(ws(),evidenceIDs)?.timeline_id||ws().manifest.items[ws().index||0].timeline_id;
+      }else{delete entry.time_ranges;delete entry.timeline_id;}
       if (fact && (nodeSignature(fact) !== nodeSignature(entry) || !sameMembers(refs, evidenceIDs))) markDependents('fact', id);
       upsert('fact', entry);
       replaceLinks('fact', id, 'evidence', evidenceIDs, 'supports'); factSeed = null;
       for (const [itemID, record] of Object.entries(ws().records)) for (const segment of record.segments) {
         if (segment.annotations.fact_id !== id) continue;
-        if (evidenceIDs.includes(JSON.stringify([itemID, segment.id]))) segment.annotations.observation = text;
-        else delete segment.annotations.fact_id;
+        if (!evidenceIDs.includes(JSON.stringify([itemID, segment.id]))) delete segment.annotations.fact_id;
       }
     }, '事实已保存，引用关系可在关联图谱中查看'));
     partitionForm(form, 'fact', ['g-fact-kind', 'g-fact-subjects', 'g-fact-speaker', 'g-fact-review']);
@@ -496,368 +545,376 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
     const layout = node('div', 'g-editor-layout'); layout.append(nodeList('event', '复合事件'));
     const form = node('div', 'g-card g-form'), event = find('event', selected.event);
     const refs = event ? linksTo('event', event.id, 'fact').map(link => link.from_id) : [];
-    form.append(node('h3', '', event ? '编辑复合事件' : '新增复合事件'), node('p', 'g-hint', '把事实精练为“谁做了什么、对象或结果是什么”的具体事件，避免把情绪或人格判断写成事件。'));
+    form.append(node('h3', '', event ? '编辑复合事件' : '新增复合事件'));
     const subjectField = inheritedSubject('g-event-subjects', () => { const ids = form.querySelector('#g-event-facts') ? values('g-event-facts') : refs; return ids.length ? subjects.fromFacts(ids) : taskSubjects(); }, event?.subject_ids || [], { multiple: true, source: '事实', preserve: !!event });
     form.append(field('事件名称 / 简练描述', textarea('g-event-title', event?.title || '', 2)), field('参与主体', subjectField), field('构成这个事件的事实', select('g-event-facts', factOptions(), refs, true), multipleHint));
     const timing = node('p', 'g-derived-time');
-    function updateTiming() { try { const bounds = boundsForFacts(values('g-event-facts')); timing.textContent = bounds ? `支持证据覆盖范围：${bounds.timeline_id} · ${rangeText(bounds)}` : '选择事实后显示支持证据覆盖范围'; } catch (error) { timing.textContent = error.message; } }
+    function updateTiming() { try {
+      const ids = values('g-event-facts');
+      const planned={...graph(),events:[{...(event||{}),id:event?.id||'event-preview'}],links:graph().links.filter(link=>!(link.to_type==='event' && link.to_id===event?.id))};
+      planned.links.push(...ids.map(id=>({from_type:'fact',from_id:id,to_type:'event',to_id:event?.id||'event-preview',type:'constitutes'})));
+      const ranges=eventTimeRanges(ws(),planned)[event?.id||'event-preview'];
+      timing.textContent = ranges.time_ranges.length ? `发生时间：${ranges.time_ranges.map(rangeText).join(' ∪ ')}` : '发生时间：待选择构成事实';
+    } catch (error) { timing.textContent = error.message; } }
     form.append(timing, reviewField('g-event', event?.review_status));
     trackForm(form, 'g-event');
     form.querySelector('#g-event-facts').addEventListener('change', () => { subjectField.refreshSubjects(true); updateTiming(); });
     saveActions(form, 'event', () => changedGraph(() => {
       const title = value('g-event-title').trim(), subjects = values('g-event-subjects'), facts = values('g-event-facts');
-      requireValue(title && subjects.length && facts.length, '请填写事件描述，并选择参与主体及构成事实');
-      const bounds = boundsForFacts(facts); requireValue(bounds, '所选事实缺少证据，无法确定事件时间轴');
+      if(!autoSaving)requireValue(title && subjects.length && facts.length, '请填写事件描述，并选择参与主体及构成事实');
+      const current=ws().manifest.items[ws().index||0],bounds = boundsForFacts(facts) || (autoSaving?{timeline_id:event?.timeline_id||current.timeline_id||current.source_id||current.id}:null); requireValue(bounds, '所选事实尚无时间，无法确定事件时间轴');
       subjectField.commitSubjects();
-      const id = event?.id || crypto.randomUUID(), entry = { id, title, subject_ids: subjects, timeline_id: bounds.timeline_id, review_status: value('g-event-review') };
+      const id = event?.id || nextAnnotationId(ws(), 'event'), entry = { ...(event||{}),id, title, subject_ids: subjects, timeline_id: bounds.timeline_id, review_status: value('g-event-review'), ...(event ? event.item_id ? { item_id: event.item_id } : {} : { item_id: currentItemID() }) };
       if (event && (nodeSignature(event) !== nodeSignature(entry) || !sameMembers(refs, facts))) markDependents('event', id);
       upsert('event', entry);
       replaceLinks('event', id, 'fact', facts, 'constitutes');
-    }, '复合事件已保存，支持证据覆盖范围已更新'));
+    }, '复合事件已保存，构成事实保持独立'));
     partitionForm(form, 'event', ['g-event-subjects', 'g-event-review']);
     layout.prepend(form); queueMicrotask(() => { if (activeStage === 'events') updateTiming(); }); return layout;
   }
 
+  function emotionEdgeEditor(link) {
+    const editor=node('section','g-emotion-edge-editor g-state-edge-list');editor.dataset.edgeId=link.id;
+    editor.append(node('h4','','关联依据'));
+    const prefix=`emotion-edge-${[...new TextEncoder().encode(link.id)].map(b=>b.toString(16).padStart(2,'0')).join('')}`;
+    const save=(mutator,control)=>{
+      const caret=control?.tagName==='TEXTAREA'?{id:control.id,start:control.selectionStart,end:control.selectionEnd}:null;
+      changedGraph(()=>{const edge=find('link',link.id);if(edge)mutator(edge);},'情感变化依据已自动保存',null);
+      if(caret){const target=document.getElementById(caret.id);target?.focus({preventScroll:true});target?.setSelectionRange(caret.start,caret.end);}
+    };
+    for(const [type,options] of [['evidence',evidenceOptions()],['fact',factOptions()],['event',eventOptions()]]){
+      const picker=select(`${prefix}-${type}`,options.map(option=>{const source=find(type,option.value),display=annotationNodePresentation(ws(),type,source);return {...option,title:`${display.id} · ${display.content}`,...(type==='evidence'?{meta:`${Math.round(source.global_start_time)}s–${Math.round(source.global_end_time)}s`}:{})};}),(link.content_refs||[]).filter(ref=>ref.node_type===type).map(ref=>ref.node_id),true);
+      picker.querySelector('select').addEventListener('change',event=>{const ids=[...event.target.selectedOptions].map(option=>option.value);save(edge=>{const previous=edge.content_refs||[];edge.content_refs=[...previous.filter(ref=>ref.node_type!==type),...ids.map(id=>previous.find(ref=>ref.node_type===type&&ref.node_id===id)||{node_type:type,node_id:id,relation:'associated_with',note:''})];});});
+      editor.append(field(`对应${TYPE_NAME[type]}`,picker));
+    }
+    const relationOptions=[{value:'associated_with',label:'有关联，未断言影响'},{value:'influences',label:'影响本次情感变化'},{value:'unrelated',label:'无关联／无影响'},{value:'insufficient_evidence',label:'证据不足'}];
+    for(const [index,ref] of (link.content_refs||[]).entries()){
+      const source=find(ref.node_type,ref.node_id);if(!source)continue;
+      const display=annotationNodePresentation(ws(),ref.node_type,source),row=node('section','g-edge-content-ref');row.dataset.refType=ref.node_type;row.dataset.refId=ref.node_id;
+      row.append(node('strong','',`${TYPE_NAME[ref.node_type]} · ${display.heading}`),node('p','',display.content));
+      if(ref.node_type==='event'&&ref.relation==='influences'){
+        const notice=eventChronologyNotice(ref.node_id,find('emotion_state',link.to_id)?.end_time);if(notice)row.append(node('p','g-temporal-warning',notice));
+      }
+      const relation=select(`${prefix}-relation-${index}`,relationOptions,ref.relation),reason=textarea(`${prefix}-reason-${index}`,ref.note,2);
+      relation.addEventListener('change',()=>save(edge=>{edge.content_refs.find(entry=>entry.node_type===ref.node_type&&entry.node_id===ref.node_id).relation=relation.value;}));
+      reason.addEventListener('input',()=>save(edge=>{edge.content_refs.find(entry=>entry.node_type===ref.node_type&&entry.node_id===ref.node_id).note=reason.value;},reason));
+      row.append(field('与本次变化的关系',relation),field('逐项判断依据',reason),button('查看／编辑原节点',()=>openNode(ref.node_type,ref.node_id),'g-link'),button('移除对应关系',()=>save(edge=>{edge.content_refs=edge.content_refs.filter(entry=>entry.node_type!==ref.node_type||entry.node_id!==ref.node_id); }),'g-link danger'));editor.append(row);
+    }
+    const note=textarea(`${prefix}-note`,link.note||'',3);note.addEventListener('input',()=>save(edge=>{edge.note=note.value;},note));editor.append(field('本次情感变化的说明／综合判断依据',note));
+    return editor;
+  }
+
+  function eventChronologyNotice(eventID,targetEnd){
+    const timing=eventTimeRanges(ws())[eventID];
+    if(!timing?.time_ranges.length)return '事件发生时间尚未完整确定，请补充构成事实；证据呈现先后不代替事件发生先后。';
+    if(Number.isFinite(Number(targetEnd))&&timing.time_ranges.every(range=>range.start_time>Number(targetEnd)+.001))return '时序冲突：事件完全发生在目标情感状态结束之后，请核对发生时间或影响判断。后续回述证据本身不构成冲突。';
+    return '';
+  }
+
   function emotionsPanel() {
     const panel = node('div', 'g-emotions');
-    const stateLayout = node('div', 'g-editor-layout'); stateLayout.append(nodeList('emotion_state', '情感状态'));
+    const layout = node('div', 'g-editor-layout'),sidebar=nodeList('emotion_state', '情感状态'); layout.append(sidebar);
+    sidebar.append(selectionTools({compact:true}));
     const form = node('div', 'g-card g-form'), state = find('emotion_state', selected.emotion_state);
     const refs = state ? linksTo('emotion_state', state.id, 'fact').map(link => link.from_id) : [];
-    const timelines = [...new Set(evidence().map(entry => entry.timeline_id))];
-    if (state?.timeline_id && !timelines.includes(state.timeline_id)) timelines.push(state.timeline_id);
-    form.append(node('h3', '', state ? '编辑情感状态' : '新增情感状态'), node('p', 'g-hint', '“皱眉、提高音量”先记为事实；“不满、紧张”是依据事实作出的情感判断。稳定情感可只记录一个状态。'));
-    const stateEvents = state ? linksTo('emotion_state', state.id, 'event').map(link => link.from_id) : [];
+    const eventLinks = state ? linksTo('emotion_state', state.id, 'event') : [];
+    const stateEvents = eventLinks.map(link => link.from_id);
+    const current=ws().manifest.items[ws().index||0],timeline=state?.timeline_id || current.timeline_id || current.source_id || current.id;
+    form.append(node('h3', '', state ? '编辑情感状态' : '新增情感状态'));
     const subjectField = inheritedSubject('g-state-subject', () => {
       const facts = form.querySelector('#g-state-facts') ? values('g-state-facts') : refs;
       const events = form.querySelector('#g-state-events') ? values('g-state-events') : stateEvents;
       return facts.length ? subjects.fromFacts(facts) : events.length ? subjects.fromEvents(events) : taskSubjects();
-    }, state?.subject_id ? [state.subject_id] : [], { source: '事实', preserve: !!state });
+    }, state?.subject_id ? [state.subject_id] : [], { source: '事实或事件', preserve: !!state, showIDs: true });
     const first = node('div', 'g-form-pair'); first.append(field('主体', subjectField), field('情感标签', input('g-state-label', state?.label || ''))); form.append(first);
-    const second = node('div', 'g-form-pair'); second.append(field('共同时间轴', select('g-state-timeline', timelines.map(id => ({ value: id, label: id })), state?.timeline_id || timelines[0] || '')), field('强度（可选）', select('g-state-intensity', [{ value: '', label: '未标强度' }, ...[1, 2, 3, 4, 5].map(n => ({ value: String(n), label: String(n) }))], state?.intensity == null ? '' : String(state.intensity)))); form.append(second);
-    const times = node('div', 'g-form-pair'); times.append(field('共同时间起点 / 秒', input('g-state-start', state?.start_time ?? '', 'number')), field('共同时间终点 / 秒', input('g-state-end', state?.end_time ?? '', 'number'))); form.append(times);
-    form.append(field('情感判断的事实依据', select('g-state-facts', factOptions(), refs, true), multipleHint), field('关联的复合事件', select('g-state-events', eventOptions(), stateEvents, true), '稳定情感状态可直接关联事件，无需人为制造一次情绪变化。' + multipleHint));
+    form.append(input('g-state-timeline',timeline,'hidden'),field('强度（可选）',select('g-state-intensity',[{value:'',label:'未标强度'},...[1,2,3,4,5].map(n=>({value:String(n),label:String(n)}))],state?.intensity==null?'':String(state.intensity))));
+    const times = node('div', 'g-form-pair'); times.append(field('观测起点 / 秒', input('g-state-start', state?.start_time ?? '', 'number')), field('观测终点 / 秒', input('g-state-end', state?.end_time ?? '', 'number'))); form.append(times);
+    form.append(field('情感判断的事实依据', select('g-state-facts', factOptions(), refs, true)));
+    const eventPicker = select('g-state-events', eventOptions(), stateEvents, true), eventSelect = eventPicker.querySelector('select');
+    const factSelect = form.querySelector('#g-state-facts');
+    let previousEvents = new Set(stateEvents);
+    eventSelect.addEventListener('change', () => {
+      const chosen = new Set([...eventSelect.selectedOptions].map(option => option.value));
+      const added = new Set([...chosen].filter(id => !previousEvents.has(id)));
+      previousEvents = chosen;
+      const defaults = new Set(graph().links.filter(link => link.from_type === 'fact' && link.to_type === 'event' && link.type === 'constitutes' && added.has(link.to_id)).map(link => link.from_id));
+      if (!defaults.size) return;
+      for (const option of factSelect.options) if (defaults.has(option.value)) option.selected = true;
+      factSelect.dispatchEvent(new Event('input', {bubbles:true})); factSelect.dispatchEvent(new Event('change', {bubbles:true}));
+    });
+    // Restoring a draft must preserve manual exclusions instead of applying defaults again.
+    eventSelect.addEventListener('graph:sync-options', () => { previousEvents = new Set([...eventSelect.selectedOptions].map(option => option.value)); });
+    form.append(field('关联／导致该状态的复合事件', eventPicker));
+    const relationPanel = node('section', 'g-event-relation-list'); relationPanel.id = 'g-state-event-relations';
+    const relationValues = new Map(eventLinks.map(link => [link.from_id, { type: link.type, note: link.note || '' }]));
+    const relationControls = new Map();
+    const relationID = (kind, id) => `g-state-${kind}-` + [...new TextEncoder().encode(id)].map(byte => byte.toString(16).padStart(2, '0')).join('');
+    function syncRelations() {
+      for (const [id, controls] of relationControls) relationValues.set(id, { type: controls.type.value, note: controls.note.value });
+      const chosen = [...eventSelect.selectedOptions].map(option => option.value);
+      for (const [id, controls] of relationControls) if (!chosen.includes(id)) for (const control of [controls.type, controls.note]) dirtyFields.delete(draftKey(control, formContext()));
+      relationControls.clear(); relationPanel.replaceChildren();
+      if (chosen.length) relationPanel.append(node('h4', '', '事件关系'));
+      for (const id of chosen) {
+        const saved = eventLinks.find(link => link.from_id === id), remembered = relationValues.get(id) || { type: 'associated_with', note: '' };
+        const type = select(relationID('relation', id), [{ value: 'associated_with', label: '关联：不作因果断言' }, { value: 'causes', label: '导致：人工因果判断' }], remembered.type);
+        const note = textarea(relationID('reason', id), remembered.note, 2);
+        for (const [control, initial] of [[type, saved?.type || 'associated_with'], [note, saved?.note || '']]) {
+          control.dataset.eventId = id;
+          const key = draftKey(control, formContext());
+          if (!fieldBaselines.has(key)) fieldBaselines.set(key, initial);
+          if (dirtyFields.has(key) && fieldDrafts.has(key)) control.value = fieldDrafts.get(key);
+          control.dataset.graphTracked = controlSignature(control);
+        }
+        const row = node('div', 'g-state-event-relation'); row.dataset.eventId = id;
+        const chronology=node('p','g-temporal-warning'),updateChronology=()=>{const message=type.value==='causes'?eventChronologyNotice(id,value('g-state-end')):'';chronology.hidden=!message;chronology.textContent=message;};
+        type.addEventListener('change',updateChronology);form.querySelector('#g-state-end').addEventListener('input',updateChronology);queueMicrotask(()=>{if(activeStage==='emotions')updateChronology();});
+        row.append(node('strong', '', find('event', id)?.title || id), field('关系', type), field('判断依据（导致时必填）', note),chronology);
+        relationPanel.append(row); relationControls.set(id, { type, note });
+      }
+    }
+    eventSelect.addEventListener('change', syncRelations); eventSelect.addEventListener('graph:sync-options', syncRelations);
+    syncRelations(); form.append(relationPanel);
     for (const id of ['g-state-facts', 'g-state-events']) form.querySelector(`#${id}`).addEventListener('change', () => subjectField.refreshSubjects(true));
-    form.append(button('按所选事实的证据范围填入时间', () => {
-      try { const bounds = boundsForFacts(values('g-state-facts')); requireValue(bounds, '先选择有证据的事实'); root.querySelector('#g-state-timeline').value = bounds.timeline_id; root.querySelector('#g-state-start').value = bounds.start_time; root.querySelector('#g-state-end').value = bounds.end_time; root.querySelector('#g-state-review').value = 'needs_review'; }
+    form.append(button('按所选依据填入时间', () => {
+      try { const facts = values('g-state-facts'), events = new Set(values('g-state-events')); const fallback = graph().links.filter(link => link.from_type==='fact' && link.to_type==='event' && link.type==='constitutes' && events.has(link.to_id)).map(link=>link.from_id); const bounds = boundsForFacts(facts.length ? facts : fallback); requireValue(bounds, '先选择有证据的事实或复合事件'); root.querySelector('#g-state-timeline').value = bounds.timeline_id; root.querySelector('#g-state-start').value = bounds.start_time; root.querySelector('#g-state-end').value = bounds.end_time; root.querySelector('#g-state-review').value = 'needs_review'; }
       catch (error) { report(error.message, true); }
     }, 'g-link'), reviewField('g-state', state?.review_status));
+    const changes=visibleGraph().links.filter(link=>link.type==='transitions_to'),slot=node('section','g-state-change-slot g-state-edge-list');slot.append(node('h4','',`状态连边（${changes.length}）`));
+    for(const link of changes){
+      const row=node('div','g-state-change-row');row.dataset.edgeId=link.id;const from=find('emotion_state',link.from_id),to=find('emotion_state',link.to_id);
+      const controlID=`emotion-edge-impact-${[...new TextEncoder().encode(link.id)].map(b=>b.toString(16).padStart(2,'0')).join('')}`,impact=select(controlID,[{value:'',label:'未标注'},{value:'yes',label:'有影响'},{value:'no',label:'无影响'},{value:'insufficient_evidence',label:'证据不足'}],link.content_influence||'');impact.dataset.edgeId=link.id;impact.setAttribute('aria-label','视频内容是否影响这次情感变化');
+      impact.addEventListener('change',()=>{const value=impact.value;changedGraph(()=>{const edge=graph().links.find(edge=>edge.id===link.id);if(value)edge.content_influence=value;else delete edge.content_influence;},'内容影响已自动保存',null);root.querySelector(`#${controlID}`)?.focus({preventScroll:true});});
+      const choose=button(`${from?.id||'?'} · ${from?.label||''} → ${to?.id||'?'} · ${to?.label||''}`,()=>{selectedEmotionEdge=link.id;render();},'g-link g-edge-select');choose.setAttribute('aria-pressed',String(selectedEmotionEdge===link.id));
+      row.append(choose,field('视频内容影响（整体判断，可选）',impact),button('删除连边',()=>changedGraph(()=>removeGraphNode(ws(),'link',link.id),'情感连边已删除',null),'g-link danger'));slot.append(row);
+    }
+    if(!changes.length)slot.append(node('p','g-hint','暂无连边'));sidebar.append(slot);
+    const editingEdge=changes.find(link=>link.id===selectedEmotionEdge);
+    if(editingEdge){
+      const edgeForm=node('section','g-card g-emotion-edge-form'),states=node('div','g-edge-state-summary');states.setAttribute('aria-label','所选连边连接的情感状态');
+      edgeForm.append(node('h3','','编辑情感变化'));
+      for(const side of ['from','to']){const state=find('emotion_state',editingEdge[`${side}_id`]);if(!state)continue;const entry=node('div','g-edge-state-panel');entry.append(node('strong','',`${entityName(state.subject_id)} · ${state.id}`),node('p','g-edge-state-label',state.label),node('small','',`${numberText(state.start_time)}–${numberText(state.end_time)}`));if(states.childElementCount)states.append(node('span','g-state-direction','→'));states.append(entry);}
+      edgeForm.append(states,emotionEdgeEditor(editingEdge));layout.prepend(edgeForm);panel.append(layout);return panel;
+    }
+    const legacy = state ? graph().emotion_transitions.filter(entry => entry.from_state_id === state.id || entry.to_state_id === state.id) : [];
+    if (legacy.length) {
+      const history = node('details', 'g-state-history'); history.append(node('summary', '', `历史情感变化记录（${legacy.length}，原样保留）`));
+      for (const entry of legacy) {
+        history.append(node('p', 'g-hint', `${labelFor('emotion_transition', entry.id)} · ${entry.note || '未填写说明'}`));
+        for (const link of linksTo('emotion_transition', entry.id, 'event')) history.append(node('p', 'g-hint', `${labelFor('event', link.from_id)} · ${RELATION_NAME[link.type] || link.type}`));
+      }
+      form.append(history);
+    }
     trackForm(form, 'g-state');
     saveActions(form, 'emotion_state', () => changedGraph(() => {
       const subject = value('g-state-subject'), label = value('g-state-label').trim(), timeline = value('g-state-timeline'), start = value('g-state-start'), end = value('g-state-end'), facts = values('g-state-facts'), events = values('g-state-events');
-      requireValue(subject && label && timeline && start !== '' && end !== '' && facts.length, '请填写主体、情感、时间和事实依据');
+      if(!autoSaving)requireValue(subject && label && timeline && start !== '' && end !== '' && (facts.length || events.length), '请填写主体、情感、时间，并至少选择一条事实或一个复合事件作为依据');
+      requireValue(timeline && start!=='' && end!=='','请先标注情感时间窗');
       requireValue(Number.isFinite(Number(start)) && Number.isFinite(Number(end)) && Number(end) > Number(start), '情感状态的终点必须大于起点');
+      const desired = events.map(eventID => {
+        const controls = relationControls.get(eventID), previous = eventLinks.find(link => link.from_id === eventID);
+        const type = controls?.type.value || 'associated_with', note = controls?.note.value || '';
+        requireValue(type !== 'causes' || note.trim(), '导致该状态的每个事件都需要填写因果判断依据');
+        return { id: previous?.id || nextAnnotationId(ws(), 'link'), from_type: 'event', from_id: eventID, to_type: 'emotion_state', to_id: state?.id || '', type, ...(note || Object.hasOwn(previous || {}, 'note') ? { note } : {}) };
+      });
       subjectField.commitSubjects();
-      const id = state?.id || crypto.randomUUID(), entry = { id, subject_id: subject, label, timeline_id: timeline, start_time: Number(start), end_time: Number(end), intensity: value('g-state-intensity') === '' ? null : Number(value('g-state-intensity')), review_status: value('g-state-review') };
-      if (state && (nodeSignature(state) !== nodeSignature(entry) || !sameMembers(refs, facts) || !sameMembers(stateEvents, events))) markDependents('emotion_state', id);
-      upsert('emotion_state', entry);
-      replaceLinks('emotion_state', id, 'fact', facts, 'grounds');
-      replaceLinks('emotion_state', id, 'event', events, 'associated_with');
+      const id = state?.id || nextAnnotationId(ws(), 'emotion_state'), entry = { id, subject_id: subject, label, timeline_id: timeline, start_time: Number(start), end_time: Number(end), intensity: value('g-state-intensity') === '' ? null : Number(value('g-state-intensity')), review_status: value('g-state-review'), ...(state ? state.item_id ? { item_id: state.item_id } : {} : { item_id: currentItemID() }) };
+      for (const link of desired) link.to_id = id;
+      const relationsChanged = desired.length !== eventLinks.length || desired.some(link => JSON.stringify(link) !== JSON.stringify(eventLinks.find(previous => previous.from_id === link.from_id)));
+      if (state && (nodeSignature(state) !== nodeSignature(entry) || !sameMembers(refs, facts) || relationsChanged)) markDependents('emotion_state', id);
+      upsert('emotion_state', entry); replaceLinks('emotion_state', id, 'fact', facts, 'grounds');
+      if (relationsChanged || !state) { graph().links = graph().links.filter(link => !(link.to_type === 'emotion_state' && link.to_id === id && link.from_type === 'event')); graph().links.push(...desired); }
     }, '情感状态已保存'));
     partitionForm(form, 'emotion_state', ['g-state-subject', 'g-state-label', 'g-state-intensity', 'g-state-review']);
-    stateLayout.prepend(form); panel.append(stateLayout);
-
-    const transitionLayout = node('div', 'g-editor-layout'); transitionLayout.append(nodeList('emotion_transition', '情感变化'));
-    const transitionForm = node('div', 'g-card g-form'), transition = find('emotion_transition', selected.emotion_transition);
-    const eventLinks = transition ? linksTo('emotion_transition', transition.id, 'event') : [];
-    const transitionSubjects = () => {
-      const fromID = transitionForm.querySelector('#g-transition-from')?.value || transition?.from_state_id;
-      const toID = transitionForm.querySelector('#g-transition-to')?.value || transition?.to_state_id;
-      const saved = [fromID, toID].flatMap(id => { const state = find('emotion_state', id); return state ? savedSubjects([state.subject_id]) : []; });
-      return saved.length ? mergeSubjects(saved) : taskSubjects();
-    };
-    const inherited = inheritedSubject('g-transition-subject', transitionSubjects, transition?.subject_id ? [transition.subject_id] : [], { source: '状态与证据', preserve: !!transition });
-    const subject = inherited.querySelector('select');
-    const selectedSubject = subject.value;
-    transitionForm.append(node('h3', '', transition ? '编辑情感变化' : '新增情感变化'), node('p', 'g-hint', '连接同一主体的前后状态。事件默认只表示关联；因果需要另行作出人工判断并填写依据。'));
-    const states = () => graph().emotion_states.filter(entry => entry.subject_id === value('g-transition-subject')).map(entry => ({ value: entry.id, label: `${entry.label} · ${entry.timeline_id} · ${rangeText(entry)}` }));
-    transitionForm.append(field('主体', inherited));
-    const statePair = node('div', 'g-form-pair');
-    const initialStates = graph().emotion_states.filter(entry => entry.subject_id === selectedSubject).map(entry => ({ value: entry.id, label: `${entry.label} · ${entry.timeline_id} · ${rangeText(entry)}` }));
-    statePair.append(field('变化前的状态', select('g-transition-from', [{ value: '', label: '请选择状态' }, ...initialStates], transition?.from_state_id || '')), field('变化后的状态', select('g-transition-to', [{ value: '', label: '请选择状态' }, ...initialStates], transition?.to_state_id || ''))); transitionForm.append(statePair);
-    function syncTransitionStates() {
-      const available = states();
-      for (const id of ['g-transition-from', 'g-transition-to']) {
-        const control = transitionForm.querySelector(`#${id}`); if (!control) continue;
-        const previous = control.value;
-        control.replaceChildren(...select('unused', [{ value: '', label: '请选择状态' }, ...available], previous).children);
-        control.value = available.some(option => option.value === previous) ? previous : '';
-      }
-    }
-    inherited.addEventListener('change', syncTransitionStates);
-    inherited.addEventListener('graph:subjects-refreshed', syncTransitionStates);
-    const relationOptions = [{ value: 'associated_with', label: '关联：不作因果断言' }, { value: 'causes', label: '因果判断（需填写依据）' }];
-    const eventPicker = select('g-transition-events', eventOptions(), eventLinks.map(link => link.from_id), true);
-    const eventSelect = eventPicker.querySelector('select');
-    const relation = select('g-transition-relation', relationOptions, eventLinks[0]?.type || 'associated_with');
-    const relationField = field('事件与情感变化的关系', relation);
-    const relations = node('section', 'g-event-relation-list'); relations.id = 'g-transition-event-relations';
-    const eventRelationValues = new Map(eventLinks.map(link => [link.from_id, link.type]));
-    const eventRelationControls = new Map();
-    let previousEvents = [...eventSelect.selectedOptions].map(option => option.value);
-    const relationID = id => 'g-transition-event-relation-' + [...new TextEncoder().encode(id)].map(byte => byte.toString(16).padStart(2, '0')).join('');
-    const context = formContext;
-    function syncEventRelations(restoreDrafts = true) {
-      if (previousEvents.length === 1) eventRelationValues.set(previousEvents[0], relation.value);
-      if (previousEvents.length > 1) for (const [id, control] of eventRelationControls) eventRelationValues.set(id, control.value);
-      const ids = [...eventSelect.selectedOptions].map(option => option.value);
-      for (const [id, control] of eventRelationControls) if (!ids.includes(id)) dirtyFields.delete(draftKey(control, context()));
-      relations.replaceChildren(node('p', 'g-hint', '每个事件分别选择关联或因果；新增关联默认不作因果断言。'));
-      eventRelationControls.clear();
-      for (const id of ids) {
-        const initial = eventLinks.find(link => link.from_id === id)?.type || 'associated_with';
-        const control = select(relationID(id), relationOptions, eventRelationValues.get(id) || initial);
-        control.dataset.eventId = id;
-        const key = draftKey(control, context());
-        if (!fieldBaselines.has(key)) fieldBaselines.set(key, initial);
-        if (restoreDrafts && dirtyFields.has(key) && fieldDrafts.has(key)) control.value = fieldDrafts.get(key);
-        eventRelationValues.set(id, control.value);
-        control.dataset.graphTracked = controlSignature(control);
-        control.addEventListener('change', () => eventRelationValues.set(id, control.value));
-        const row = field(find('event', id)?.title || id, control); row.classList.add('g-event-relation-row'); row.dataset.eventId = id;
-        eventRelationControls.set(id, control); relations.append(row);
-      }
-      relationField.hidden = ids.length > 1; relations.hidden = ids.length <= 1;
-      if (ids.length === 1) relation.value = eventRelationValues.get(ids[0]) || 'associated_with';
-      previousEvents = ids;
-    }
-    eventSelect.addEventListener('change', syncEventRelations);
-    eventSelect.addEventListener('graph:sync-options', syncEventRelations);
-    relation.addEventListener('change', () => {
-      if (previousEvents.length === 1) {
-        const id = previousEvents[0]; eventRelationValues.set(id, relation.value);
-        const control = eventRelationControls.get(id); if (control) { control.value = relation.value; control.dataset.graphTracked = controlSignature(control); }
-      }
-    });
-    syncEventRelations(false);
-    transitionForm.append(field('关联事件', eventPicker, multipleHint), relationField, relations, field('变化说明 / 因果判断依据', textarea('g-transition-note', transition?.note || '', 3)), reviewField('g-transition', transition?.review_status));
-    trackForm(transitionForm, 'g-transition');
-    saveActions(transitionForm, 'emotion_transition', () => changedGraph(() => {
-      const subjectID = value('g-transition-subject'), from = value('g-transition-from'), to = value('g-transition-to'), events = values('g-transition-events');
-      requireValue(subjectID && from && to && from !== to, '请选择同一主体的两个不同情感状态'); requireValue(events.length, '请选择关联这一情感变化的事件');
-      const id = transition?.id || crypto.randomUUID();
-      inherited.commitSubjects();
-      upsert('emotion_transition', { id, subject_id: subjectID, from_state_id: from, to_state_id: to, note: value('g-transition-note').trim(), review_status: value('g-transition-review') });
-      const previous = linksTo('emotion_transition', id, 'event');
-      const desired = events.map(eventID => ({ eventID, type: events.length === 1 ? relation.value : eventRelationControls.get(eventID)?.value || eventRelationValues.get(eventID) || 'associated_with' }));
-      if (!sameMembers(previous.map(link => link.from_id), events) || desired.some(entry => previous.find(link => link.from_id === entry.eventID)?.type !== entry.type)) {
-        graph().links = graph().links.filter(link => !(link.to_type === 'emotion_transition' && link.to_id === id && link.from_type === 'event'));
-        for (const entry of desired) graph().links.push({ id: previous.find(link => link.from_id === entry.eventID)?.id || crypto.randomUUID(), from_type: 'event', from_id: entry.eventID, to_type: 'emotion_transition', to_id: id, type: entry.type });
-      }
-    }, '情感变化已保存'));
-    partitionForm(transitionForm, 'emotion_transition', ['g-transition-subject', 'g-transition-from', 'g-transition-to', 'g-transition-relation', 'g-transition-review']);
-    transitionLayout.prepend(transitionForm); panel.append(transitionLayout, emotionTimeline()); return panel;
+    layout.prepend(form); panel.append(layout); return panel;
   }
 
-  function emotionTimeline() {
-    const section = node('section', 'g-card g-emotion-timeline'); section.append(node('h3', '', '主体的情感时间序列'));
-    for (const entity of graph().entities) {
-      const all = graph().emotion_states.filter(entry => entry.subject_id === entity.id);
-      if (!all.length) continue;
-      section.append(node('h4', '', entity.name));
-      for (const timeline of new Set(all.map(state => state.timeline_id))) {
-        const states = all.filter(state => state.timeline_id === timeline).sort((a, b) => a.start_time - b.start_time);
-        const low = Math.min(...states.map(state => state.start_time)), high = Math.max(...states.map(state => state.end_time)), span = Math.max(.001, high - low);
-        section.append(node('p', 'g-hint', `${timeline} · ${numberText(low)} → ${numberText(high)}`));
-        for (const state of states) {
-          const line = node('div', 'g-state-track'); const band = button(`${state.label}${state.intensity == null ? '' : ` · ${state.intensity}/5`} · ${rangeText(state)}`, () => openNode('emotion_state', state.id), 'g-state-band');
-          band.style.left = `${(state.start_time - low) / span * 100}%`; band.style.width = `${Math.max(.8, (state.end_time - state.start_time) / span * 100)}%`; band.title = labelFor('emotion_state', state.id); line.append(band); section.append(line);
-        }
-      }
-      for (const transition of graph().emotion_transitions.filter(entry => entry.subject_id === entity.id)) section.append(button(`变化：${labelFor('emotion_transition', transition.id)}`, () => openNode('emotion_transition', transition.id), 'g-link'));
+  function focusGraphNode(type,id,force=false) {
+    if(!force && graphFocus && graphFocus.type!=='link' && (graphFocus.type!==type||graphFocus.id!==id)){
+      const link=graph().links.find(link=>link.from_type===type && link.from_id===id && link.to_type===graphFocus.type && link.to_id===graphFocus.id && link.type!=='transitions_to');
+      if(link){graphReferenceID=link.id;referenceDeletion=null;render();return;}
     }
-    if (!graph().emotion_states.length) section.append(node('p', 'g-empty', '建立情感状态后，这里会按主体和共同时间轴排列。'));
-    return section;
+    graphReferenceID=null;referenceDeletion=null;const category=type==='emotion_transition'?'emotion_state':type; if(graphCategory!==category){graphSearch='';graphListScroll=0;}graphFocus={type,id};graphCategory=category;render();
   }
-
-  function directedGraph(data) {
+  function factColorLegend(){const legend=node('div','g-fact-color-legend');for(const [kind,label] of [['observation','观察事实'],['reported_speech','转述事实']]){const entry=node('span','',label);entry.style.setProperty('--fact-color',FACT_COLORS[kind]);legend.append(entry);}return legend;}
+  function directedGraph() {
     const section = node('section', 'g-card g-directed-graph');
-    const toolbar = node('div', 'g-graph-toolbar'); toolbar.append(node('h3', '', '四层关联有向图'));
-    const ns = 'http://www.w3.org/2000/svg';
-    const svgNode = (tag, attrs = {}, text = '') => { const element = document.createElementNS(ns, tag); for (const [key, val] of Object.entries(attrs)) element.setAttribute(key, String(val)); if (text) element.textContent = text; return element; };
-    const viewLinks = graphViewLinks(graph());
-    const projection = projectGraphView(data, viewLinks, graphFocus, { page: graphPage });
-    const displayed = projection.data; graphPage = projection.page;
-    const height = Math.max(260, 80 + Math.max(...displayed.map(([, entries]) => entries.length)) * 88);
-    const svg = svgNode('svg', { id: 'g-directed-svg', xmlns: ns, viewBox: `0 0 1450 ${height}`, width: 1450, height, role: 'img', 'aria-label': '证据、事实、复合事件和情感脉络的有向关联图' });
-    svg.append(svgNode('rect', { width: 1450, height, fill: '#fbfcf8' }));
-    const defs = svgNode('defs'), marker = svgNode('marker', { id: 'g-arrow', viewBox: '0 0 10 10', refX: 9, refY: 5, markerWidth: 8, markerHeight: 8, orient: 'auto-start-reverse' });
-    marker.append(svgNode('path', { d: 'M 0 0 L 10 5 L 0 10 z', fill: '#657d64' })); defs.append(marker); svg.append(defs);
-    const positions = new Map(), width = 265;
-    displayed.forEach(([title, entries], col) => {
-      const x = 24 + col * 345;
-      svg.append(svgNode('text', { x, y: 28, fill: '#284731', 'font-size': 16, 'font-family': 'sans-serif', 'font-weight': 600 }, `${title}（${data[col][1].length}）`));
-      entries.forEach(({ type, entry }, row) => positions.set(JSON.stringify([type, entry.id]), { x, y: 52 + row * 88, type, entry }));
-    });
-    const edgeGroup = svgNode('g', { 'data-graph-layer': 'edges' }), nodeGroup = svgNode('g', { 'data-graph-layer': 'nodes' });
-    const labelNames = { ...RELATION_NAME, before_state: '变化前', after_state: '变化后' };
-    const relatedNodes = new Set(), relatedEdges = new Set();
-    const forward = new Map(), backward = new Map();
-    for (const link of viewLinks) {
-      const from = JSON.stringify([link.from_type, link.from_id]), to = JSON.stringify([link.to_type, link.to_id]);
-      if (!forward.has(from)) forward.set(from, []); forward.get(from).push(link);
-      if (!backward.has(to)) backward.set(to, []); backward.get(to).push(link);
+    const current=ws().manifest.items[ws().index||0],preferred=current.timeline_id||current.source_id||current.id;
+    const model = fourLayerTimeline(materialWorkspace(ws()), {timeline: graphTimeline||preferred, focus: graphFocus, range:graphRange,windowStart:graphWindowStart,windowSpan:graphWindowSpan});model.selectedReference=graphReferenceID; graphTimeline = model.timeline;graphWindowStart=model.low;
+    const toolbar = node('div', 'g-graph-toolbar'); toolbar.append(node('h3', '', '关联图谱'));
+    const controls = node('div', 'g-graph-size-controls');
+    const all=button('展示完整关联图谱',()=>{graphFocus=null;graphReferenceID=null;referenceDeletion=null;render();});all.id='g-graph-show-all';
+    const fullRange=button('全片范围',()=>{graphRange='full';render();});fullRange.id='g-graph-range-full';fullRange.setAttribute('aria-pressed',String(graphRange==='full'));
+    const localRange=button('局部范围',()=>{graphRange='local';render();});localRange.id='g-graph-range-local';localRange.setAttribute('aria-pressed',String(graphRange==='local'));
+    const spanInput=input('g-graph-window-span',model.high-model.low,'number');spanInput.min='.1';spanInput.step='.1';spanInput.max=model.fullHigh-model.fullLow;spanInput.disabled=graphRange==='full';
+    const spanField=field('时间跨度 / 秒',spanInput);spanField.classList.add('g-graph-span-field');
+    spanInput.addEventListener('change',()=>{const span=Number(spanInput.value);if(!Number.isFinite(span)||span<=0){spanInput.value=model.high-model.low;return;}const next=Math.max(.1,Math.min(span,model.fullHigh-model.fullLow));graphWindowStart=(model.low+model.high)/2-next/2;graphWindowSpan=next;graphRange='local';render();});
+    const viewport = node('div', 'g-svg-viewport fit');viewport.dataset.sizeMode='fit'; viewport.innerHTML = serializeTimelineSVG(model);
+    queueMicrotask(()=>{if(!viewport.isConnected)return;const fitType=()=>{const width=viewport.querySelector('svg')?.getBoundingClientRect().width;if(width>0)viewport.style.setProperty('--graph-text-scale',String(1450/width));};fitType();graphTypographyObserver=new ResizeObserver(fitType);graphTypographyObserver.observe(viewport);});
+    const zoomWindow=event=>{
+      if(event.ctrlKey||event.metaKey)return;event.preventDefault();
+      const delta=event.deltaY||event.deltaX,unit=event.deltaMode===1?16:event.deltaMode===2?viewport.clientHeight:1,total=model.fullHigh-model.fullLow;
+      const span=graphRange==='local'?graphWindowSpan:model.high-model.low,next=Math.max(Math.min(.1,total),Math.min(total,span*Math.exp(Math.max(-1,Math.min(1,delta*unit*.002)))));
+      const rect=viewport.getBoundingClientRect(),anchor=event.currentTarget===viewport?Math.max(0,Math.min(1,(event.clientX-rect.left)/rect.width)):.5;
+      graphWindowStart=Math.max(model.fullLow,Math.min(model.fullHigh-next,graphWindowStart+anchor*(span-next)));graphWindowSpan=next;graphRange=next>=total?'full':'local';
+      if(!graphPanFrame)graphPanFrame=requestAnimationFrame(()=>{graphPanFrame=0;if(activeStage==='graph')render();});
+    };
+    viewport.addEventListener('wheel',zoomWindow,{passive:false});
+    const svg = viewport.querySelector('svg');
+    for (const item of svg.querySelectorAll('[data-node-type]')) {
+      const focus = () => focusGraphNode(item.dataset.nodeType,item.dataset.nodeId);
+      item.addEventListener('click', focus); item.addEventListener('keydown', event => { if (event.key === 'Enter' || event.key === ' ') {event.preventDefault();focus();} });
+      item.addEventListener('dblclick',()=>focusGraphNode(item.dataset.nodeType,item.dataset.nodeId,true));
     }
-    if (graphFocus) for (const direction of ['forward', 'backward']) {
-      const queue = [JSON.stringify([graphFocus.type, graphFocus.id])], visited = new Set();
-      while (queue.length) {
-        const key = queue.shift(); if (visited.has(key)) continue; visited.add(key); relatedNodes.add(key);
-        for (const link of (direction === 'forward' ? forward : backward).get(key) || []) {
-          const fromKey = JSON.stringify([link.from_type, link.from_id]), toKey = JSON.stringify([link.to_type, link.to_id]);
-          if ((direction === 'forward' ? fromKey : toKey) === key) { relatedEdges.add(link.id); queue.push(direction === 'forward' ? toKey : fromKey); }
-        }
+    for(const item of svg.querySelectorAll('[data-edge-kind="emotion-transition"],[data-edge-hit]')){const select=()=>{graphReferenceID=null;referenceDeletion=null;graphFocus={type:'link',id:item.dataset.edgeId||item.dataset.edgeHit};graphCategory='emotion_state';graphSearch='';render();};item.addEventListener('click',select);item.addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();select();}});}
+    controls.append(all,fullRange,localRange,spanField);toolbar.append(controls);section.append(toolbar);
+    const rangeControls=node('div','g-graph-window-control'),rangeLabel=node('output','g-graph-range-label'),track=node('div','g-graph-window-track'),windowBox=node('div','g-graph-window-box');
+    rangeLabel.id='g-graph-range-label';rangeLabel.setAttribute('aria-live','polite');track.id='g-graph-window-track';windowBox.id='g-graph-window-box';windowBox.tabIndex=0;windowBox.setAttribute('role','slider');windowBox.setAttribute('aria-label','显示时间窗口，拖动平移，滚轮调整覆盖时长');windowBox.append(node('span','','⋮⋮'));
+    const total=model.fullHigh-model.fullLow;let drag=null;
+    const updateWindow=()=>{const span=graphRange==='full'?total:graphWindowSpan;windowBox.style.left=`min(${(graphWindowStart-model.fullLow)/total*100}%, calc(100% - 8px))`;windowBox.style.width=`${span/total*100}%`;windowBox.dataset.start=graphWindowStart;windowBox.dataset.end=graphWindowStart+span;windowBox.setAttribute('aria-valuemin',model.fullLow);windowBox.setAttribute('aria-valuemax',model.fullHigh-span);windowBox.setAttribute('aria-valuenow',graphWindowStart);windowBox.setAttribute('aria-valuetext',`${numberText(graphWindowStart)} 至 ${numberText(graphWindowStart+span)}`);rangeLabel.textContent=`${numberText(graphWindowStart)} → ${numberText(graphWindowStart+span)} · ${numberText(span)}`;};
+    const previewWindow=()=>{updateWindow();const preview=fourLayerTimeline(materialWorkspace(ws()),{timeline:graphTimeline,focus:graphFocus,range:graphRange,windowStart:graphWindowStart,windowSpan:graphWindowSpan});preview.selectedReference=graphReferenceID;viewport.innerHTML=serializeTimelineSVG(preview);const svg=viewport.querySelector('svg');svg.dataset.rangeStart=preview.low;svg.dataset.rangeEnd=preview.high;};
+    const finishWindow=()=>{drag=null;render();root.querySelector('#g-graph-window-box')?.focus({preventScroll:true});};
+    track.addEventListener('pointerdown',event=>{if(event.button!==0)return;event.preventDefault();const span=model.high-model.low,rect=track.getBoundingClientRect();drag={pointer:event.pointerId,x:event.clientX,start:graphWindowStart,span,width:rect.width};track.setPointerCapture(event.pointerId);if(!event.target.closest('.g-graph-window-box')){graphWindowStart=Math.max(model.fullLow,Math.min(model.fullHigh-span,model.fullLow+(event.clientX-rect.left)/rect.width*total-span/2));drag.start=graphWindowStart;previewWindow();}windowBox.classList.add('dragging');});
+    track.addEventListener('pointermove',event=>{if(!drag||event.pointerId!==drag.pointer)return;graphWindowStart=Math.max(model.fullLow,Math.min(model.fullHigh-drag.span,drag.start+(event.clientX-drag.x)/drag.width*total));graphWindowSpan=drag.span;previewWindow();});
+    track.addEventListener('pointerup',event=>{if(drag&&event.pointerId===drag.pointer)finishWindow();});
+    track.addEventListener('pointercancel',()=>{if(drag){graphWindowStart=model.low;graphWindowSpan=model.high-model.low;finishWindow();}});
+    track.addEventListener('lostpointercapture',()=>{if(drag)finishWindow();});
+    windowBox.addEventListener('keydown',event=>{if(!['ArrowLeft','ArrowRight','Home','End'].includes(event.key))return;event.preventDefault();event.stopPropagation();const span=model.high-model.low,step=span*(event.shiftKey ? .25 : .05);graphWindowStart=Math.max(model.fullLow,Math.min(model.fullHigh-span,event.key==='Home'?model.fullLow:event.key==='End'?model.fullHigh-span:graphWindowStart+(event.key==='ArrowLeft'?-step:step)));render();root.querySelector('#g-graph-window-box')?.focus({preventScroll:true});});
+    rangeControls.addEventListener('wheel',event=>{if(!drag)zoomWindow(event);else event.preventDefault();},{passive:false});
+    track.append(windowBox);const ends=node('div','g-graph-window-ends');ends.append(node('span','',numberText(model.fullLow)),node('span','',numberText(model.fullHigh)));rangeControls.append(rangeLabel,track,ends);updateWindow();section.append(rangeControls);
+    svg.dataset.rangeStart=model.low;svg.dataset.rangeEnd=model.high;
+    if(graphFocus?.type==='link'){
+      const edge=find('link',graphFocus.id);section.append(node('p','g-graph-focus',`已选关系：${RELATION_NAME[edge.type]||edge.type}`));
+    } else if (graphFocus) {
+      const display=annotationNodePresentation(ws(),graphFocus.type,find(graphFocus.type,graphFocus.id));
+      const focus=node('div','g-graph-focus');focus.append(node('span','',`${display.heading} · ${display.content}`),button(graphFocus.type==='evidence'?'回放此证据':'编辑此节点',()=>openNode(graphFocus.type,graphFocus.id),'g-link'));section.append(focus);
+    }
+    section.append(viewport);
+    if(graphFocus && graphFocus.type!=='link'){
+      const direct=graph().links.filter(link=>link.to_type===graphFocus.type && link.to_id===graphFocus.id && link.type!=='transitions_to');
+      if(direct.length){const parents=node('section','g-direct-parents');parents.append(node('h4','','直接上级'));for(const link of direct){const parent=find(link.from_type,link.from_id);if(!parent)continue;const display=annotationNodePresentation(ws(),link.from_type,parent),choice=button(`${display.heading} · ${display.content}`,()=>{graphReferenceID=link.id;referenceDeletion=null;render();},'g-direct-parent');choice.dataset.linkId=link.id;choice.setAttribute('aria-pressed',String(graphReferenceID===link.id));parents.append(choice);}section.append(parents);}
+      if(graphReferenceID)section.append(node('p','g-reference-hint','退格解除此关联'));
+    }
+    if(graphFocus?.type==='link'){
+      const edge=find('link',graphFocus.id),details=node('section','g-edge-state-summary');details.setAttribute('aria-label','情感转移前后状态');
+      for(const side of ['from','to']){const state=edge?.[`${side}_type`]==='emotion_state'?find('emotion_state',edge[`${side}_id`]):null;if(!state)continue;const display=annotationNodePresentation(ws(),'emotion_state',state),entry=node('section','g-edge-state-panel');entry.dataset.stateId=state.id;entry.dataset.side=side;entry.append(node('strong','',display.heading),node('p','g-edge-state-label',state.label),node('small','',`${numberText(state.start_time)}–${numberText(state.end_time)}${state.intensity==null?'':` · 强度 ${state.intensity}/5`}`));if(details.childElementCount){const arrow=node('span','g-state-direction','→');arrow.setAttribute('role','img');arrow.setAttribute('aria-label','状态转移方向');details.append(arrow);}details.append(entry);}
+      section.append(details);if(edge?.type==='transitions_to')section.append(emotionEdgeEditor(edge));
+    }
+    if(graphFocus && model.upstream.length) {
+      const summaries=node('section','g-upstream-summary');summaries.append(node('h4','',`上游关联概要（${model.upstream.length}）`));
+      const entries=node('div','g-upstream-summary-items');
+      for(const track of model.tracks) {
+        const upstream=model.upstream.filter(entry=>entry.type===track.type);if(!upstream.length)continue;
+        const group=node('section','g-upstream-group');group.append(node('strong','',`${track.title} · ${upstream.length}`));
+        for(const entry of upstream){const item=button('',()=>focusGraphNode(entry.type,entry.entry.id),'g-upstream-item');item.dataset.nodeType=entry.type;item.dataset.nodeId=entry.entry.id;item.append(node('strong','',entry.heading),node('span','',entry.content));group.append(item);}
+        entries.append(group);
       }
+      summaries.append(entries);section.append(summaries);
     }
-    for (const link of projection.links) {
-      const from = positions.get(JSON.stringify([link.from_type, link.from_id])), to = positions.get(JSON.stringify([link.to_type, link.to_id]));
-      if (!from || !to) continue;
-      const x1 = from.x + width, y1 = from.y + 34, sameColumn = from.x === to.x, x2 = sameColumn ? to.x + width : to.x, y2 = to.y + 34;
-      const bend = sameColumn ? Math.max(x1, x2) + 78 : (x1 + x2) / 2;
-      const focused = relatedEdges.has(link.id);
-      const path = svgNode('path', { d: `M ${x1} ${y1} C ${bend} ${y1}, ${bend} ${y2}, ${x2} ${y2}`, fill: 'none', stroke: focused ? '#285b39' : '#71836b', 'stroke-width': focused ? 2.5 : 1.6, 'marker-end': 'url(#g-arrow)', 'data-edge-id': link.id });
-      if (link.type === 'associated_with' || sameColumn) path.setAttribute('stroke-dasharray', '5 4');
-      path.append(svgNode('title', {}, `${labelFor(link.from_type, link.from_id)} — ${labelNames[link.type]} → ${labelFor(link.to_type, link.to_id)}`)); edgeGroup.append(path);
-      const labelX = sameColumn ? bend - 8 : (x1 + x2) / 2;
-      edgeGroup.append(svgNode('text', { x: labelX, y: (y1 + y2) / 2 - 6, 'text-anchor': 'middle', 'font-family': 'sans-serif', 'font-size': 10, fill: '#52684c', stroke: '#fbfcf8', 'stroke-width': 3, 'paint-order': 'stroke' }, labelNames[link.type] || link.type));
-    }
-    for (const position of positions.values()) {
-      const { x, y, type, entry } = position;
-      const focused = graphFocus?.type === type && graphFocus?.id === entry.id;
-      const related = relatedNodes.has(JSON.stringify([type, entry.id]));
-      const group = svgNode('g', { tabindex: 0, role: 'button', 'data-node-type': type, 'data-node-id': entry.id, 'aria-label': `${TYPE_NAME[type]}：${labelFor(type, entry.id)}`, cursor: 'pointer' });
-      const color = type === 'evidence' ? '#eef2f6' : type === 'fact' ? '#edf3e7' : type === 'event' ? '#f7f1e4' : '#f2edf4';
-      group.append(svgNode('rect', { x, y, width, height: 68, rx: 4, fill: focused ? '#dcebd2' : related ? '#eef5e5' : color, stroke: focused ? '#29583a' : related ? '#78966a' : '#b4c3ac', 'stroke-width': focused ? 2.5 : 1 }));
-      const characters = [...short(labelFor(type, entry.id), 40)], first = characters.slice(0, 20).join(''), second = characters.slice(20, 40).join('');
-      group.append(svgNode('text', { x: x + 10, y: y + 21, fill: '#294330', 'font-family': 'sans-serif', 'font-size': 12 }, first));
-      if (second) group.append(svgNode('text', { x: x + 10, y: y + 39, fill: '#294330', 'font-family': 'sans-serif', 'font-size': 12 }, second));
-      const meta = type === 'evidence' ? `${numberText(entry.global_start_time)} → ${numberText(entry.global_end_time)}` : REVIEW_NAME[entry.review_status] || TYPE_NAME[type];
-      group.append(svgNode('text', { x: x + 10, y: y + 57, fill: '#61705c', 'font-family': 'sans-serif', 'font-size': 10 }, meta));
-      group.append(svgNode('title', {}, labelFor(type, entry.id)));
-      const focus = () => { graphFocus = { type, id: entry.id }; graphPage = 0; render(); };
-      group.addEventListener('click', focus); group.addEventListener('keydown', event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); focus(); } });
-      nodeGroup.append(group);
-    }
-    svg.append(edgeGroup, nodeGroup);
-    const exportButton = button('导出当前视图 SVG', () => {
-      const copy = svg.cloneNode(true); copy.removeAttribute('role'); copy.removeAttribute('style'); copy.setAttribute('width', '1450'); copy.setAttribute('height', String(height)); copy.setAttribute('data-export-scope', 'current-view');
-      const serialized = '<?xml version="1.0" encoding="UTF-8"?>\n' + new XMLSerializer().serializeToString(copy);
-      const url = URL.createObjectURL(new Blob([serialized], { type: 'image/svg+xml;charset=utf-8' })), link = node('a');
-      link.href = url; link.download = 'four-layer-graph.svg'; document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
-    }); exportButton.id = 'g-export-svg';
-    const fullExportButton = button('导出完整图谱 SVG', () => {
-      const serialized = serializeFullGraphSVG(data, viewLinks, { labelFor, reviewNames: REVIEW_NAME, relationNames: RELATION_NAME });
-      const url = URL.createObjectURL(new Blob([serialized], { type: 'image/svg+xml;charset=utf-8' })), link = node('a');
-      link.href = url; link.download = 'four-layer-full-graph.svg'; document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
-    }); fullExportButton.id = 'g-export-full-svg';
-    const viewport = node('div', 'g-svg-viewport');
-    const sizeControls = node('div', 'g-graph-size-controls');
-    const fitButton = button('适应宽度', () => { graphFit = true; syncSize(); }); fitButton.id = 'g-graph-fit';
-    const originalButton = button('原始大小', () => { graphFit = false; syncSize(); }); originalButton.id = 'g-graph-original';
-    function syncSize() {
-      viewport.classList.toggle('fit', graphFit); viewport.dataset.sizeMode = graphFit ? 'fit' : 'original';
-      fitButton.setAttribute('aria-pressed', String(graphFit)); originalButton.setAttribute('aria-pressed', String(!graphFit));
-    }
-    sizeControls.append(fitButton, originalButton, exportButton, fullExportButton); toolbar.append(sizeControls); section.append(toolbar);
-    const summary = node('p', 'g-hint', `${projection.mode === 'focus' ? '聚焦当前节点及其上下游' : '全部节点'}：本页 ${projection.shown} / 范围 ${projection.scopeTotal} / 项目 ${projection.total} 个节点。虚线表示关联或状态衔接，不自动推断因果。`); summary.id = 'g-graph-view-summary'; section.append(summary);
-    const paging = node('div', 'g-graph-page-controls'); paging.id = 'g-graph-page-controls';
-    const previousPage = button('上一页', () => { graphPage--; render(); }); previousPage.id = 'g-graph-prev'; previousPage.disabled = !projection.page;
-    const nextPage = button('下一页', () => { graphPage++; render(); }); nextPage.id = 'g-graph-next'; nextPage.disabled = projection.page >= projection.pageCount - 1;
-    const pageStatus = node('span', '', `${projection.page + 1} / ${projection.pageCount}`); pageStatus.id = 'g-graph-page-status';
-    paging.append(previousPage, pageStatus, nextPage); section.append(paging);
-    viewport.append(svg); syncSize(); section.append(viewport); return section;
+    return section;
   }
 
   function graphPanel() {
     const panel = node('div', 'g-graph-panel');
-    panel.append(node('p', 'g-flow-caption', '点击节点查看上下游，可回放证据或编辑标注。图随关联自动生成。'));
-    const columns = node('div', 'g-graph-columns');
-    const data = [['证据', evidence().map(entry => ({ type: 'evidence', entry }))], ['事实', graph().facts.map(entry => ({ type: 'fact', entry }))], ['复合事件', graph().events.map(entry => ({ type: 'event', entry }))], ['情感脉络', [...graph().emotion_states.map(entry => ({ type: 'emotion_state', entry })), ...graph().emotion_transitions.map(entry => ({ type: 'emotion_transition', entry }))]]];
+    const columns = node('div', 'g-graph-columns'), categoryTabs=node('div','g-graph-category-tabs'); categoryTabs.setAttribute('role','tablist');categoryTabs.setAttribute('aria-label','节点分类');
+    const data = [['证据', evidence().map(entry => ({ type: 'evidence', entry }))], ['事实', visibleGraph().facts.map(entry => ({ type: 'fact', entry }))], ['复合事件', visibleGraph().events.map(entry => ({ type: 'event', entry }))], ['情感脉络', visibleGraph().emotion_states.map(entry => ({ type: 'emotion_state', entry }))]];
     const neighbors = new Set();
-    if (graphFocus) for (const link of graph().links) {
+    if(graphFocus?.type==='link'){
+      const edge=find('link',graphFocus.id);for(const side of ['from','to'])if(edge?.[`${side}_type`]==='emotion_state')neighbors.add(JSON.stringify(['emotion_state',edge[`${side}_id`]]));
+    } else if (graphFocus) for (const link of graph().links) {
+      if(link.type==='transitions_to')continue;
       if (link.from_type === graphFocus.type && link.from_id === graphFocus.id) neighbors.add(JSON.stringify([link.to_type, link.to_id]));
       if (link.to_type === graphFocus.type && link.to_id === graphFocus.id) neighbors.add(JSON.stringify([link.from_type, link.from_id]));
     }
-    for (const [title, items] of data) {
-      const column = node('section', 'g-graph-column'); column.append(node('h4', '', `${title}（${items.length}）`));
+    for (const [index, [title, items]] of data.entries()) {
+      const category=['evidence','fact','event','emotion_state'][index];
+      const tab=button(`${['证据','事实','复合事件','情感'][index]} ${items.length}`,()=>{graphCategory=category;graphSearch='';graphListScroll=0;render();});
+      tab.dataset.category=category;tab.id=`g-graph-category-${category}`;tab.setAttribute('role','tab');tab.setAttribute('aria-selected',String(graphCategory===category));tab.setAttribute('aria-controls',`g-graph-nodes-${category}`);categoryTabs.append(tab);
+      const column = node('section', 'g-graph-column');column.dataset.category=category;column.id=`g-graph-nodes-${category}`;column.setAttribute('role','tabpanel');column.setAttribute('aria-labelledby',tab.id); column.append(node('h4', '', `${title}（${items.length}）`));
       const scroll = node('div', 'g-graph-scroll');
       for (const { type, entry } of items) {
         const focused = graphFocus?.type === type && graphFocus?.id === entry.id;
-        const item = button('', () => { graphFocus = { type, id: entry.id }; graphPage = 0; render(); }, 'g-graph-node' + (focused ? ' active' : neighbors.has(JSON.stringify([type, entry.id])) ? ' related' : ''));
+        const item = button('', () => focusGraphNode(type,entry.id), 'g-graph-node' + (focused ? ' active' : neighbors.has(JSON.stringify([type, entry.id])) ? ' related' : ''));
         item.dataset.nodeType = type; item.dataset.nodeId = entry.id;
-        item.append(node('strong', '', short(labelFor(type, entry.id), 95)), node('small', '', type === 'evidence' ? `共同时间 ${numberText(entry.global_start_time)} → ${numberText(entry.global_end_time)}` : REVIEW_NAME[entry.review_status] || TYPE_NAME[type]));
+        const display = annotationNodePresentation(ws(),type,entry);
+        item.style.setProperty('--node-color',display.color);
+        if(display.tag&&type!=='evidence') item.append(node('small','g-node-type-tag',display.tag));
+        item.append(node('strong','',type==='evidence'?display.id:display.cardHeading),node('span','g-node-description',display.content));
+        if(type==='evidence')item.append(node('small','g-evidence-node-time',`${Math.round(entry.global_start_time)}s–${Math.round(entry.global_end_time)}s`));
+        if(type==='fact'||type==='event') item.append(node('small','',`参与主体：${display.subjects}`));
         scroll.append(item);
       }
       if (!items.length) scroll.append(node('p', 'g-empty', '尚无节点')); column.append(scroll); columns.append(column);
     }
-    panel.append(directedGraph(data));
-    const nodeBrowser = node('details', 'g-graph-browser'); nodeBrowser.append(node('summary', '', '展开节点列表'), columns); panel.append(nodeBrowser);
-    const relation = node('section', 'g-card'); relation.append(node('h3', '', graphFocus ? `${TYPE_NAME[graphFocus.type]}的上下游关系` : '全部关联关系'));
-    if (graphFocus) relation.append(node('p', 'g-focus-label', labelFor(graphFocus.type, graphFocus.id)), button(graphFocus.type === 'evidence' ? '回放此证据' : '编辑此节点', () => openNode(graphFocus.type, graphFocus.id), 'g-button'), button('显示全部关系', () => { graphFocus = null; graphPage = 0; render(); }, 'g-link'));
-    const relevant = graphFocus ? graph().links.filter(link => (link.from_type === graphFocus.type && link.from_id === graphFocus.id) || (link.to_type === graphFocus.type && link.to_id === graphFocus.id)) : graph().links;
-    const relationList = node('div', 'g-relation-list');
-    for (const link of relevant) {
-      const row = node('div', 'g-relation-row');
-      row.append(button(short(labelFor(link.from_type, link.from_id), 85), () => { graphFocus = { type: link.from_type, id: link.from_id }; graphPage = 0; render(); }, 'g-link'), node('span', 'g-relation-type', `— ${RELATION_NAME[link.type] || link.type} →`), button(short(labelFor(link.to_type, link.to_id), 85), () => { graphFocus = { type: link.to_type, id: link.to_id }; graphPage = 0; render(); }, 'g-link'));
-      relationList.append(row);
-    }
-    if (!relevant.length) relationList.append(node('p', 'g-empty', '暂无这组关联。请在事实、事件或情感表单中选择依据。'));
-    relation.append(relationList); panel.append(relation, emotionTimeline());
-    const validation = node('section', 'g-card g-validation'); validation.id = 'g-validation'; validation.append(node('h3', '', '四层完整性检查'));
-    const issues = graphIssues(ws()), errors = issues.filter(issue => issue.severity === 'error');
-    if (issues.length) {
-      const list = node('ul'); for (const issue of issues) { const item = node('li', issue.severity === 'error' ? 'g-issue-error' : 'g-issue-warning'); item.append(node('span', '', issue.message)); if (issue.node_type && issue.node_id && (COLLECTION[issue.node_type] || issue.node_type === 'evidence')) item.append(button('定位', () => openNode(issue.node_type, issue.node_id), 'g-link')); list.append(item); } validation.append(list);
-    } else validation.append(node('p', 'g-complete', '未发现完整性问题。'));
-    validation.append(button('标记四层完成', () => {
-      if (hasUnsavedChanges()) { report('仍有表单尚未保存，请先保存或处理未提交内容，再标记四层完成', true); return; }
-      const problems = graphIssues(ws()).filter(issue => issue.severity === 'error');
-      if (problems.length) { report(`还有 ${problems.length} 项未完成：${problems[0].message}`, true); root.querySelector('#g-validation').scrollIntoView({ block: 'nearest' }); return; }
-      const previous = graph().status;
-      try { graph().status = 'complete'; ws().graph = normalizeGraph(graph(), ws()); changed(); render(); report('四层已通过完整性检查并标记完成'); }
-      catch (error) { graph().status = previous; report(error.message, true); }
-    }, 'g-button primary'));
-    validation.append(node('p', 'g-hint', errors.length ? `当前有 ${errors.length} 项阻止完成的问题。检查核对引用与时序，不自动证明事实、因果或双标一致。` : '结构检查不自动证明事实、因果或双标一致；“已人工确认”表示完成本轮复核。'));
-    panel.append(validation); return panel;
+    const mapLayout=node('div','g-graph-layout'), nodeBrowser=node('aside','g-graph-browser');
+    const search=input('g-graph-node-search',graphSearch);search.type='search';search.placeholder='搜索编号、主体或内容';search.setAttribute('aria-label','搜索图谱节点');
+    const emptySearch=node('p','g-empty','本分类没有匹配节点');
+    const filterNodes=()=>{graphSearch=search.value;const term=graphSearch.trim().toLocaleLowerCase();for(const item of columns.querySelectorAll('.g-graph-node')) item.hidden=!`${item.dataset.nodeId} ${item.textContent}`.toLocaleLowerCase().includes(term);for(const section of columns.querySelectorAll('.g-graph-column')) section.hidden=section.dataset.category!==graphCategory;emptySearch.hidden=!term || [...columns.querySelectorAll(`.g-graph-column[data-category="${graphCategory}"] .g-graph-node`)].some(item=>!item.hidden);};
+    search.addEventListener('input',filterNodes);filterNodes();
+    columns.append(emptySearch);nodeBrowser.append(node('h3','','节点列表'),categoryTabs,search,columns);columns.addEventListener('scroll',()=>{graphListScroll=columns.scrollTop;});
+    mapLayout.append(directedGraph(data),nodeBrowser);panel.append(mapLayout);queueMicrotask(()=>{columns.scrollTop=graphListScroll;});
+    return panel;
   }
 
   function render() {
+    graphTypographyObserver?.disconnect();graphTypographyObserver=null;
     captureFields();
     const workspace = ws(); root.hidden = !workspace;
+    undoButton.disabled = !workspace || !canUndo?.();
     if (!workspace) { fieldDrafts.clear(); fieldBaselines.clear(); dirtyFields.clear(); renderedContext = null; updateUnsavedNote(); return; }
-    if (renderedContext && renderedContext.workspace !== workspace.id) {
+    if (renderedContext && (renderedContext.workspace !== workspace.id || draftWorkspace !== workspace)) {
+      stateSelection.clear();selectedEmotionEdge='';
+      for (const view of Object.values(timelineViews)) for (const key of Object.keys(view)) delete view[key];
       activeStage = 'evidence'; graphFocus = null; graphPage = 0; factSeed = null;
+      graphReferenceID=null;referenceDeletion=null;graphTimeline=null;graphRange='full';graphSearch='';graphListScroll=0;graphCategory='evidence';graphWindowStart=null;graphWindowSpan=60;
       for (const type of Object.keys(selected)) selected[type] = '';
       fieldDrafts.clear(); fieldBaselines.clear(); dirtyFields.clear(); renderedContext = null;
     }
     if (!workspace.graph) workspace.graph = blankGraph();
+    if(draftWorkspace!==workspace){draftWorkspace=workspace;temporalConflicts.clear();for(const [key,entry] of workspace.ui_temporal_conflicts||[])if(typeof key==='string'&&entry?.message)temporalConflicts.set(key,{itemID:entry.itemID,error:new Error(entry.message)});for(const entry of workspace.ui_form_drafts || []){if(!Array.isArray(entry)||typeof entry[0]!=='string')continue;const [key,value,baseline]=entry;if(JSON.parse(key)[0]!==workspace.id)continue;fieldDrafts.set(key,value);fieldBaselines.set(key,baseline);dirtyFields.add(key);}}
+    for (const id of stateSelection) if (!find('emotion_state', id)) stateSelection.delete(id);
     if (subjectWorkspace !== workspace) { subjectWorkspace = workspace; subjects = createSubjectResolver(workspace); }
     if (renderedContext?.itemID && renderedContext.itemID !== currentItemID()) {
+      stateSelection.clear();selectedEmotionEdge='';
+      for(const view of Object.values(timelineViews))for(const key of Object.keys(view))delete view[key];graphSearch='';graphListScroll=0;
       for (const type of ['fact', 'event', 'emotion_state', 'emotion_transition']) selected[type] = '';
       factSeed = null;
+      graphFocus=null;graphReferenceID=null;referenceDeletion=null;graphTimeline=null;graphWindowStart=null;graphRange='full';
     }
     if (graphFocus && !find(graphFocus.type, graphFocus.id)) { graphFocus = null; graphPage = 0; }
     root.dataset.stage = activeStage;
-    const counts = { evidence: evidence().length, facts: graph().facts.length, events: graph().events.length, emotions: graph().emotion_states.length + graph().emotion_transitions.length };
+    const counts = { evidence: evidence().length, facts: visibleGraph().facts.length, events: visibleGraph().events.length, emotions: visibleGraph().emotion_states.length };
     status.textContent = graph().status === 'complete' ? '四层已完成' : '四层待完成'; status.classList.toggle('complete', graph().status === 'complete');
     tabs.replaceChildren();
     for (const [id, text] of STAGES) {
-      const tab = button(`${text}${id in counts ? ` ${counts[id]}` : ''}`, () => stage(id), 'g-tab' + (activeStage === id ? ' active' : ''));
+      const tab = button(text, () => stage(id), 'g-tab' + (activeStage === id ? ' active' : ''));
+      if(id in counts)tab.append(document.createTextNode(' '),node('span','g-tab-count',String(counts[id])));
       tab.dataset.stage = id; tab.setAttribute('aria-current', activeStage === id ? 'step' : 'false'); tabs.append(tab);
     }
     const editor = document.querySelector('.editor-grid'), footer = document.querySelector('.task-footer');
+    const showTimeline = ['facts', 'events', 'emotions'].includes(activeStage);
+    const preview = document.getElementById('shared-media-preview');
+    const previewParent = showTimeline ? previewHost : document.querySelector('.media-column');
+    if (preview && previewParent && preview.parentElement !== previewParent) previewParent.prepend(preview);
+    layerView.hidden = !showTimeline;
+    layerTimeline = null; timelineHost.replaceChildren();
+    if (showTimeline) {
+      layerTimeline = createAnnotationTimeline({ ws: materialWorkspace(workspace), stage: activeStage, selected, view: timelineViews[activeStage], onSelect: openNode, onSeek: seekFromTimeline, getPlaybackTime, onGestureStart: pausePlayback, onEdit: editTimeline, onCreate: (...args) => createTimelineDraft(activeStage, ...args), stateSelection, onToggleState: toggleStateSelection });
+      timelineHost.append(layerTimeline.element);
+    }
     if (editor) editor.hidden = activeStage !== 'evidence'; if (footer) footer.hidden = activeStage !== 'evidence';
     body.replaceChildren();
-    if (activeStage === 'evidence') body.append(node('p', 'g-stage-hint', '在下方标记时间窗、选择主体并填写事实描述；保存后直接建立证据与事实的关联。事实汇总可继续整理多模态依据。'));
-    if (activeStage === 'evidence') body.append(management());
     if (activeStage === 'facts') body.append(factsPanel());
     else if (activeStage === 'events') body.append(eventsPanel());
     else if (activeStage === 'emotions') body.append(emotionsPanel());
     else if (activeStage === 'graph') body.append(graphPanel());
-    if (activeStage !== 'evidence') body.append(management());
     const context = formContext();
     recordBaselines(context); restoreFields(context);
     for (const wrapper of body.querySelectorAll('.g-subject-lineage')) wrapper.refreshSubjects();
     restoreFields(context);
     const speaker = body.querySelector('#g-fact-speaker'); if (speaker) speaker.closest('.g-field').hidden = value('g-fact-kind') !== 'reported_speech';
     renderedContext = context; captureFields(); updateUnsavedNote();
+    const conflict=[...temporalConflicts.values()].find(entry=>entry.itemID===currentItemID());if(conflict)report(conflict.error.message,true,true);
   }
   function openFactFromEvidence(id) {
     const entry = find('evidence', id); if (!entry) return report('请先选择有效证据时间窗', true);
@@ -871,5 +928,25 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, navigateEvide
   }
   render();
   function hasUnsavedChanges() { captureFields(); return updateUnsavedNote(); }
-  return { render, openFactFromEvidence, hasUnsavedChanges, setStage: stage, get stage() { return activeStage; } };
+  function restoreAfterUndo() {
+    captureFields();
+    for (const [type, id] of Object.entries(selected)) if (id && COLLECTION[type] && !find(type, id)) selected[type] = '';
+    pruneRemovedContexts(); renderedContext = null; subjectWorkspace = null; render();
+  }
+  function deleteSelectedReference(){
+    if(activeStage==='graph' && graphReferenceID){const link=graph().links.find(link=>link.id===graphReferenceID);if(link)changedGraph(()=>removeGraphNode(ws(),'link',link.id),'已解除这一条上级关联，两端节点均保留',null);return true;}
+    if(!referenceDeletion)return false;const type=activeStage==='facts'?'fact':activeStage==='events'?'event':'emotion_state',context=JSON.stringify([ws().id,activeStage,selected[type]||'',currentItemID()]);
+    if(referenceDeletion.context!==context){referenceDeletion=null;return false;}const control=root.querySelector(`#${referenceDeletion.control}`);if(!control){referenceDeletion=null;return false;}
+    const option=[...control.options].find(option=>option.value===referenceDeletion.id);if(!option?.selected)return true;option.selected=false;control.dispatchEvent(new Event('input',{bubbles:true}));control.dispatchEvent(new Event('change',{bubbles:true}));autosave();if(referenceDeletion)referenceDeletion.context=JSON.stringify([ws().id,activeStage,selected[type]||'',currentItemID()]);report('已解除这一条上级关联，两端节点均保留');return true;
+  }
+  function deleteSelected(){if(deleteSelectedReference())return true;const focus=activeStage==='graph'?graphFocus:activeStage==='facts'?{type:'fact',id:selected.fact}:activeStage==='events'?{type:'event',id:selected.event}:activeStage==='emotions'?{type:'emotion_state',id:selected.emotion_state}:null;if(!focus?.id)return false;clearTimeout(autoTimer);if(focus.type==='evidence')deleteEvidence?.(focus.id);else {remove(focus.type,focus.id,false);graphFocus=null;}return true;}
+  function assertReadyToExport(itemID) {
+    captureFields();
+    const temporalField=/^(g-fact-time-(mode|start-\d+|end-\d+)|g-fact-evidence|g-event-facts|g-state-(start|end|facts|events))$/;
+    const pendingTime=renderedContext&&[...body.querySelectorAll('input[id],select[id]')].some(element=>temporalField.test(element.id)&&dirtyFields.has(draftKey(element,renderedContext)));
+    if(temporalConflicts.size||pendingTime)autosave();
+    const conflict = [...temporalConflicts.values()].find(entry => !itemID || entry.itemID === itemID);
+    if (conflict) throw new Error(`请先调整时间冲突后再保存：${conflict.error.message}`);
+  }
+  return { render, restoreAfterUndo, openFactFromEvidence, hasUnsavedChanges, autosave,retainDrafts,deleteSelected,deleteSelectedReference, assertReadyToExport, setStage: stage, get stage() { return activeStage; } };
 }

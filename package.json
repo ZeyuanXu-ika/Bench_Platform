@@ -1,16 +1,24 @@
 {
   "name": "bench-platform",
-  "version": "2.1.0",
+  "version": "0.9.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test tests/core.test.mjs tests/graph.test.mjs tests/v2.test.mjs tests/graph-view.test.mjs tests/subject-lineage.test.mjs tests/evidence-fact.test.mjs",
+    "test": "node --test tests/core.test.mjs tests/graph.test.mjs tests/v2.test.mjs tests/graph-view.test.mjs tests/subject-lineage.test.mjs tests/evidence-fact.test.mjs tests/annotation-timeline.test.mjs tests/history.test.mjs tests/export-files.test.mjs tests/id-codes.test.mjs tests/temporal-order.test.mjs tests/material-pairing.test.mjs",
+    "test:pairing-browser": "node tests/material-pairing.browser.mjs",
     "test:browser": "node tests/browser.mjs",
     "test:graph-browser": "node tests/graph-browser.mjs",
+    "test:timeline-browser": "node tests/timeline-edit.browser.mjs",
+    "test:emotion-browser": "node tests/emotion-subject.browser.mjs",
+    "test:undo-browser": "node tests/annotation-undo.browser.mjs",
+    "test:export-browser": "node tests/item-export.browser.mjs",
     "test:frontend-browser": "node tests/frontend-continuation.browser.mjs",
     "test:relation-browser": "node tests/relation-editor.browser.mjs",
     "test:subject-browser": "node tests/subject-lineage.browser.mjs",
-    "test:evidence-browser": "node tests/evidence-fact.browser.mjs"
+    "test:evidence-browser": "node tests/evidence-fact.browser.mjs",
+    "test:workflow-browser": "node tests/workflow-v3.browser.mjs",
+    "test:emotion-sidebar-browser": "node tests/emotion-sidebar.browser.mjs",
+    "test:temporal-browser": "node tests/temporal-semantics.browser.mjs"
   },
   "devDependencies": {
     "playwright": "^1.64.1"

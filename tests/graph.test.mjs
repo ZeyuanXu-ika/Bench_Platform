@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { blankGraph, evidenceKey, evidenceNodes, evidenceBounds, normalizeGraph, migrateLegacyGraph, graphIssues,
-  invalidateEvidence, removeEvidence, removeGraphNode, MAX_GRAPH_NODES, MAX_GRAPH_LINKS } from '../graph.mjs';
+import { blankGraph, evidenceKey, evidenceNodes, evidenceBounds, evidenceTimeRanges, eventTimeRanges, normalizeGraph, migrateLegacyGraph, graphIssues,
+  invalidateEvidence, removeEvidence, removeGraphNode, connectEmotionStates, connectEmotionStateSelection, MAX_GRAPH_NODES, MAX_GRAPH_LINKS } from '../graph.mjs';
 
 function workspace() {
   return { manifest: { items: [{ id: 'video', title: 'Test video', media_type: 'video', source_id: 'source', timeline_id: 'scene', time_offset_s: 0, clip_start_s: 100 }] },
@@ -9,6 +9,34 @@ function workspace() {
       annotations: { subject_id: 'person_1', local_fact: '人物将文件放到桌面', observation: '' } }] } }, graph: blankGraph() };
 }
 function link(id, from_type, from_id, to_type, to_id, type) { return { id, from_type, from_id, to_type, to_id, type }; }
+
+test('time union merges overlaps and touching windows while preserving genuine gaps and offsets', () => {
+  const ws = workspace(); ws.manifest.items[0].time_offset_s = 5;
+  ws.records.video.segments = [[100, 110], [15, 25], [10, 20], [25, 26], [12, 14]].map(([start_time, end_time], n) => ({ id: String(n), start_time, end_time }));
+  const refs = ws.records.video.segments.map(s => evidenceKey('video', s.id));
+  const before = structuredClone(ws);
+  assert.deepEqual(evidenceTimeRanges(ws, [...refs, refs[0]]), { timeline_id: 'scene', time_ranges: [{ start_time: 15, end_time: 31 }, { start_time: 105, end_time: 115 }] });
+  assert.deepEqual(ws, before);
+  assert.equal(evidenceTimeRanges(ws, []), null);
+  assert.throws(() => evidenceTimeRanges(ws, ['missing']), /不存在/);
+  ws.manifest.items.push({ id: 'audio', timeline_id: 'other' });
+  ws.records.audio = { segments: [{ id: 'a', start_time: 0, end_time: 1 }] };
+  assert.throws(() => evidenceTimeRanges(ws, [refs[0], evidenceKey('audio', 'a')]), /不同时间轴/);
+});
+
+test('event union preserves gaps inside a single fact and recomputes after evidence and relation edits', () => {
+  const ws = closedGraph();
+  ws.records.video.segments.push({ id: 'later', start_time: 100, end_time: 110 });
+  ws.graph.links.push(link('extra', 'evidence', evidenceKey('video', 'later'), 'fact', 'f1', 'supports'));
+  assert.deepEqual(eventTimeRanges(ws).ev1.time_ranges, [{ start_time: 0, end_time: 2 }, { start_time: 100, end_time: 110 }]);
+  ws.records.video.segments[1].start_time = 1;
+  assert.deepEqual(eventTimeRanges(ws).ev1.time_ranges, [{ start_time: 0, end_time: 110 }]);
+  ws.graph.links.pop();
+  assert.deepEqual(eventTimeRanges(ws).ev1.time_ranges, [{ start_time: 0, end_time: 2 }]);
+  ws.graph.links = ws.graph.links.filter(l => l.type !== 'supports');
+  assert.equal(eventTimeRanges(ws).ev1.status, 'unresolved');
+  assert.deepEqual(eventTimeRanges(ws).ev1.time_ranges, []);
+});
 function closedGraph() {
   const ws = workspace();
   ws.graph = { status: 'complete', entities: [{ id: 'p1', name: '人物 1', aliases: ['黄衣人'] }],
@@ -32,6 +60,80 @@ function transitionGraph() {
     link('l7', 'fact', 'f2', 'emotion_state', 's2', 'grounds'), link('l8', 'event', 'ev2', 'emotion_transition', 't1', 'associated_with'));
   return ws;
 }
+
+test('the compact state change creates one stable direct edge without a transition node or event requirement', () => {
+  const ws = transitionGraph(), beforeNodes = ws.graph.emotion_transitions.length;
+  const edge = connectEmotionStates(ws, 's1', 's2');
+  assert.equal(edge.type, 'transitions_to');
+  assert.equal(connectEmotionStates(ws, 's1', 's2').id, edge.id);
+  assert.equal(ws.graph.links.filter(link => link.type === 'transitions_to').length, 1);
+  assert.equal(ws.graph.emotion_transitions.length, beforeNodes);
+  assert.deepEqual(normalizeGraph(ws.graph, ws), ws.graph);
+});
+
+test('state change edges reject different subjects, timelines, identical nodes and reversed time atomically', () => {
+  for (const invalid of ['subject', 'timeline', 'order', 'same']) {
+    const ws = transitionGraph();
+    if (invalid === 'subject') ws.graph.emotion_states[1].subject_id = 'other';
+    if (invalid === 'timeline') ws.graph.emotion_states[1].timeline_id = 'other';
+    const before = structuredClone(ws);
+    assert.throws(() => connectEmotionStates(ws, invalid === 'order' ? 's2' : 's1', invalid === 'same' ? 's1' : invalid === 'order' ? 's1' : 's2'));
+    assert.deepEqual(ws, before);
+  }
+});
+
+test('event causes state relations preserve per-edge evidence and reject missing justification or future causes', () => {
+  const ws = closedGraph(), cause = ws.graph.links.find(link => link.to_type === 'emotion_state' && link.from_type === 'event');
+  cause.type = 'causes';
+  assert.ok(graphIssues(ws).some(issue => /因果关系需要填写逐事件/.test(issue.message)));
+  cause.note = '人物在该事件中受到直接刺激，结合言语和动作判断。';
+  assert.equal(graphIssues(ws).filter(issue => issue.severity === 'error').length, 0);
+  assert.equal(normalizeGraph(ws.graph, ws).links.find(link => link.id === cause.id).note, cause.note);
+  ws.graph.status = 'draft'; ws.records.video.segments[0].start_time = 10; ws.records.video.segments[0].end_time = 12;
+  assert.ok(graphIssues(ws).some(issue => /状态结束之后/.test(issue.message)));
+});
+
+test('state change content influence is explicit optional metadata and survives normalization',()=>{
+  const ws=closedGraph();ws.graph.status='draft';ws.graph.emotion_states.push({...ws.graph.emotion_states[0],id:'s2',start_time:3,end_time:4});ws.graph.links.push(link('change','emotion_state','s1','emotion_state','s2','transitions_to'));
+  const edge=ws.graph.links.at(-1);for(const value of ['yes','no','insufficient_evidence']){edge.content_influence=value;assert.equal(normalizeGraph(ws.graph,ws).links.at(-1).content_influence,value);}
+  edge.content_influence='invalid';assert.throws(()=>normalizeGraph(ws.graph,ws),/内容影响/);delete edge.content_influence;assert.equal(Object.hasOwn(normalizeGraph(ws.graph,ws).links.at(-1),'content_influence'),false);
+});
+
+test('late-presented evidence now reports the required end-order conflict despite an explanation',()=>{
+  const ws=closedGraph();ws.graph.status='draft';Object.assign(ws.records.video.segments[0],{start_time:10,end_time:12});
+  Object.assign(ws.graph.facts[0],{timeline_id:'scene',time_ranges:[{start_time:1,end_time:2}],time_note:'后续回述前段事实'});Object.assign(ws.graph.emotion_states[0],{start_time:5,end_time:6});
+  const cause=ws.graph.links.find(link=>link.from_type==='event');Object.assign(cause,{type:'causes',note:'事件发生在状态之前，证据是后续回述'});
+  assert.ok(graphIssues(ws).some(issue=>issue.code==='TEMPORAL_ORDER'&&issue.from_type==='evidence'));
+  assert.equal(normalizeGraph(ws.graph,ws).facts[0].time_note,'后续回述前段事实');
+  ws.graph.facts[0].time_ranges=[{start_time:20,end_time:22}];assert.ok(graphIssues(ws).some(issue=>issue.severity==='error'&&/状态结束之后/.test(issue.message)));
+});
+
+test('non-overlapping fact and evidence windows ask for an explanation without blocking drafts',()=>{
+  const ws=closedGraph();ws.graph.status='draft';Object.assign(ws.graph.facts[0],{timeline_id:'scene',time_ranges:[{start_time:5,end_time:6}]});
+  const warning=()=>graphIssues(ws).find(issue=>issue.node_type==='fact'&&/填写时间说明/.test(issue.message));assert.equal(warning().severity,'warning');assert.doesNotThrow(()=>normalizeGraph(ws.graph,ws));
+  ws.graph.facts[0].time_note='前提证据先于事实';assert.equal(warning(),undefined);assert.equal(normalizeGraph(ws.graph,ws).facts[0].time_note,'前提证据先于事实');
+});
+
+test('emotion-transition influence checks event occurrence instead of evidence presentation',()=>{
+  const ws=closedGraph();ws.graph.status='draft';ws.graph.emotion_states.push({...ws.graph.emotion_states[0],id:'s2',start_time:4,end_time:5});
+  ws.graph.links.push({...link('change','emotion_state','s1','emotion_state','s2','transitions_to'),content_refs:[{node_type:'event',node_id:'ev1',relation:'influences',note:'早期事件触发变化，后段回述'}]});
+  Object.assign(ws.records.video.segments[0],{start_time:10,end_time:12});Object.assign(ws.graph.facts[0],{timeline_id:'scene',time_ranges:[{start_time:2,end_time:3}],time_note:'后段回述'});
+  assert.equal(graphIssues(ws).filter(issue=>issue.node_type==='link'&&issue.node_id==='change').length,0);
+  ws.graph.facts[0].time_ranges=[{start_time:8,end_time:9}];assert.ok(graphIssues(ws).some(issue=>issue.node_id==='change'&&issue.severity==='error'&&/不能影响/.test(issue.message)));
+  ws.graph.links.at(-1).content_refs[0].relation='associated_with';assert.ok(graphIssues(ws).some(issue=>issue.node_id==='change'&&issue.code==='TEMPORAL_ORDER'));
+});
+
+test('emotion edges retain independently assessed evidence, facts and events and clean deleted references',()=>{
+  const ws=closedGraph();ws.graph.status='draft';ws.graph.emotion_states.push({...ws.graph.emotion_states[0],id:'s2',start_time:3,end_time:4});
+  const refs=[{node_type:'evidence',node_id:evidenceKey('video','window'),relation:'influences',note:'可观察到的触发依据'}, {node_type:'fact',node_id:'f1',relation:'insufficient_evidence',note:'尚不能确认'}, {node_type:'event',node_id:ws.graph.events[0].id,relation:'associated_with',note:''}];
+  ws.graph.links.push({...link('change','emotion_state','s1','emotion_state','s2','transitions_to'),content_refs:refs,note:'变化的综合解释'});
+  assert.deepEqual(normalizeGraph(ws.graph,ws).links.at(-1).content_refs,refs);
+  const invalid=structuredClone(ws.graph);invalid.links.at(-1).content_refs[0].node_id='missing';assert.throws(()=>normalizeGraph(invalid,ws),/不存在/);
+  const duplicate=structuredClone(ws.graph);duplicate.links.at(-1).content_refs.push(refs[0]);assert.throws(()=>normalizeGraph(duplicate,ws),/重复/);
+  const malformed=structuredClone(ws.graph);malformed.links.at(-1).content_refs[0].relation='bad';assert.throws(()=>normalizeGraph(malformed,ws),/关系无效/);
+  removeGraphNode(ws,'fact','f1');assert.ok(ws.graph.links.find(link=>link.id==='change').content_refs.every(ref=>ref.node_type!=='fact'));assert.equal(ws.graph.emotion_states.length,2);
+  removeEvidence(ws,evidenceKey('video','window'));assert.ok(ws.graph.links.find(link=>link.id==='change').content_refs.every(ref=>ref.node_type!=='evidence'));
+});
 
 test('evidence identity uses a safe item/segment tuple and derives global time without mutating media windows', () => {
   const ws = workspace(), before = structuredClone(ws);
@@ -97,12 +199,25 @@ test('cross-timeline support remains editable in a draft but blocks completion',
   ws.graph.status = 'complete'; assert.throws(() => normalizeGraph(ws.graph, ws), /不能标记完成/);
 });
 
-test('a state requires factual grounding and an event association to close all four layers', () => {
+test('a state can be supported by facts alone or an event alone', () => {
   for (const omitted of ['l3', 'l4']) {
     const ws = closedGraph(); ws.graph.status = 'draft'; ws.graph.links = ws.graph.links.filter(edge => edge.id !== omitted);
-    assert.ok(graphIssues(ws).some(issue => issue.severity === 'error' && issue.node_id === 's1'));
-    ws.graph.status = 'complete'; assert.throws(() => normalizeGraph(ws.graph, ws), /不能标记完成/);
+    assert.equal(graphIssues(ws).some(issue => issue.severity === 'error' && issue.node_id === 's1'),false);
+    ws.graph.status = 'complete'; assert.doesNotThrow(() => normalizeGraph(ws.graph, ws));
   }
+});
+
+test('an emotion state with neither fact nor event support is rejected',()=>{
+  const ws=closedGraph();ws.graph.links=ws.graph.links.filter(edge=>!['l3','l4'].includes(edge.id));
+  assert.ok(graphIssues(ws).some(issue=>issue.node_id==='s1' && issue.message.includes('至少需要')));
+  assert.throws(()=>normalizeGraph(ws.graph,ws),/不能标记完成/);
+});
+
+test('explicit emotion facts remain a subset of event constituents without implicit grounds edges',()=>{
+  const ws=transitionGraph();ws.graph.links.push(link('extra','fact','f1','event','ev2','constitutes'));
+  const before=structuredClone(ws.graph.links), normalized=normalizeGraph(ws.graph,ws);
+  assert.deepEqual(ws.graph.links,before);
+  assert.deepEqual(normalized.links.filter(edge=>edge.to_type==='emotion_state' && edge.to_id==='s2' && edge.from_type==='fact').map(edge=>edge.from_id),['f2']);
 });
 
 test('an ordered same-subject transition can associate both states to a concrete event', () => {
@@ -132,11 +247,31 @@ test('reported speech needs an identified speaker and states retain optional bou
   ws.graph.emotion_states[0].intensity = null; assert.doesNotThrow(() => normalizeGraph(ws.graph, ws));
 });
 
-test('unconfirmed graph nodes and unbound coreference mentions prevent completion', () => {
+test('review flags do not block annotators while unbound identity references still prevent completion', () => {
   const ws = closedGraph(); ws.graph.status = 'draft'; ws.graph.facts[0].review_status = 'needs_review'; ws.graph.mentions[0].entity_id = '';
   const errors = graphIssues(ws).filter(issue => issue.severity === 'error');
-  assert.ok(errors.some(issue => issue.message.includes('人工确认'))); assert.ok(errors.some(issue => issue.message.includes('统一主体')));
+  assert.ok(!errors.some(issue => issue.message.includes('人工确认'))); assert.ok(errors.some(issue => issue.message.includes('统一主体')));
   ws.graph.status = 'complete'; assert.throws(() => normalizeGraph(ws.graph, ws), /不能标记完成/);
+  ws.graph.mentions[0].entity_id = 'p1'; assert.doesNotThrow(() => normalizeGraph(ws.graph, ws));
+});
+
+test('multi-selected states connect in chronological order independently of selection order', () => {
+  const ws = transitionGraph();
+  ws.graph.emotion_states.push({ ...ws.graph.emotion_states[1], id: 's3', start_time: 6, end_time: 8 });
+  const edges = connectEmotionStateSelection(ws, ['s3', 's1', 's2', 's1']);
+  assert.deepEqual(edges.map(edge => [edge.from_id, edge.to_id]), [['s1', 's2'], ['s2', 's3']]);
+  connectEmotionStateSelection(ws, ['s2', 's3', 's1']);
+  assert.equal(ws.graph.links.filter(link => link.type === 'transitions_to').length, 2);
+});
+
+test('invalid multi-selection is atomic, including cross-subject choices and later overlaps', () => {
+  for (const invalid of ['subject', 'overlap', 'missing', 'single']) {
+    const ws = transitionGraph(); ws.graph.emotion_states.push({ ...ws.graph.emotion_states[1], id: 's3', start_time: 3, end_time: 7 });
+    if (invalid === 'subject') ws.graph.emotion_states[1].subject_id = 'other';
+    const before = structuredClone(ws);
+    assert.throws(() => connectEmotionStateSelection(ws, invalid === 'missing' ? ['s1', 'missing'] : invalid === 'single' ? ['s1'] : ['s1', 's2', 's3']));
+    assert.deepEqual(ws, before);
+  }
 });
 
 test('a subject mentioned elsewhere in a project does not ground its identity in an unrelated fact window', () => {
@@ -147,7 +282,7 @@ test('a subject mentioned elsewhere in a project does not ground its identity in
   ws.graph.links.push(link('extra', 'evidence', evidenceKey('video', 'elsewhere'), 'fact', 'f2', 'supports'));
   assert.doesNotThrow(() => normalizeGraph(ws.graph, ws));
   assert.ok(graphIssues(ws).some(issue => issue.node_id === 'f1' && issue.message.includes('本事实的支持窗')));
-  ws.graph.status = 'complete'; assert.throws(() => normalizeGraph(ws.graph, ws), /不能标记完成/);
+  ws.graph.status = 'complete'; assert.doesNotThrow(() => normalizeGraph(ws.graph, ws));
 });
 
 test('a reported speaker needs a mention in that fact support and cannot alone ground another subject emotion', () => {
