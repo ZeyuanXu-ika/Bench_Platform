@@ -1,5 +1,5 @@
 import { LABELS, MAX_JSON_BYTES, MAX_ITEMS, MAX_SEGMENTS, MEDIA_RE, blankRecord, cleanSegment, completionErrors,
-  displayTime, editInterval, identifier, makeExport, makeItemExport, makeItemExportFiles, packAnnotationFiles, manifestFromFiles, matchFile, newWorkspace, parseManifest, parseResults, planMediaImport, safeFilename, createWorkspaceHistory } from './core.mjs';
+  displayTime, editInterval, identifier, makeExport, makeItemExport, makeItemExportFiles, packAnnotationFiles, manifestFromFiles, matchFile, newWorkspace, parseJSON, parseManifest, parseResults, planMediaImport, safeFilename, createWorkspaceHistory } from './core.mjs';
 import { listWorkspaces, removeWorkspace, storeWorkspace } from './storage.mjs';
 import { evidenceKey, invalidateEvidence, removeEvidence, migrateLegacyGraph, nextAnnotationId, annotationIdCounters, assertEvidenceTimeChange } from './graph.mjs';
 import { pairMaterialResults } from './material-results.mjs';
@@ -8,7 +8,11 @@ import { mountEvidenceEditor } from './evidence-editor.mjs';
 import { annotationNodePresentation } from './graph-view.mjs';
 import { packTimelineRows } from './annotation-timeline.mjs';
 
+import { installGTViewer } from './gt-viewer.mjs';
+
 const $ = id => document.getElementById(id);
+const gtViewer = installGTViewer($('gt-dialog'), parseJSON, MAX_JSON_BYTES);
+$('open-gt').addEventListener('click', () => gtViewer.show());
 function paintPlayIcon(paused){$('play-toggle').replaceChildren(uiIcon(paused?'play':'pause'));$('play-toggle').title=paused?'播放（空格）':'暂停（空格）';}
 const SETTINGS_KEY = `bench-settings-v1:${new URL('.', location.href).pathname}`;
 const DEFAULT_SETTINGS = { height: 'auto', fit: 'contain', speed: '1', step: '0.1', export: 'picker' };
@@ -355,8 +359,16 @@ async function importManifest(file) {
 }
 async function importResults(files) {
   const list=Array.from(files||[]);if(!list.length)return;
+  const inputs = await Promise.all(list.map(async file => ({ file, raw: parseJSON(await readJSON(file)) })));
+  const gt = inputs.find(({ raw }) => typeof raw?.schema_version === 'string' && raw.schema_version.startsWith('trace-label/'));
+  if (gt) {
+    if (inputs.length !== 1) throw new Error('请逐个打开四层 GT JSON；平台标注结果可以批量导入。');
+    pairingItemID = null;
+    await gtViewer.showFile(gt.file);
+    return;
+  }
   graphWorkbench?.autosave();await enqueueDraft();let next=ws;
-  for(const file of list){const imported=parseResults(await readJSON(file));
+  for(const { file, raw } of inputs){const imported=parseResults(raw);
     if(!next){next=imported;for(const task of next.manifest.items)next.records[task.id].annotation_source={file_name:file.name,material_id:task.id,annotation_id:task.id};}
     else next=pairMaterialResults(next,imported,file.name,pairingItemID);
   }
