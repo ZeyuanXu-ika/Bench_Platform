@@ -8,7 +8,7 @@ import { materialGraph, materialWorkspace } from './material-scope.mjs';
 const STAGES = [['evidence', '证据'], ['facts', '事实'], ['events', '复合事件'], ['emotions', '情感脉络'], ['graph', '关联图谱']];
 const COLLECTION = { entity: 'entities', mention: 'mentions', fact: 'facts', event: 'events', emotion_state: 'emotion_states', emotion_transition: 'emotion_transitions', link:'links' };
 const TYPE_NAME = { link:'关系', evidence: '证据', entity: '主体', mention: '提及', fact: '事实', event: '复合事件', emotion_state: '情感状态', emotion_transition: '情感变化' };
-const RELATION_NAME = { supports: '支持', constitutes: '构成', grounds: '情感判断依据', associated_with: '关联', causes: '导致（人工判断）', transitions_to: '情感变化' };
+const RELATION_NAME = { supports: '支持', constitutes: '构成', grounds: '情感判断依据', associated_with: '关联', causes: '导致（人工判断）', influences: '影响', unrelated: '无关', insufficient_evidence: '证据不足', transitions_to: '情感变化' };
 const node = (tag, className, content) => { const value = document.createElement(tag); if (className) value.className = className; if (content !== undefined) value.textContent = content; return value; };
 export function uiIcon(name){const icon=document.createElementNS('http://www.w3.org/2000/svg','svg'),use=document.createElementNS('http://www.w3.org/2000/svg','use');icon.classList.add('ui-icon');icon.setAttribute('aria-hidden','true');icon.setAttribute('focusable','false');use.setAttribute('href',`#icon-${name}`);icon.append(use);return icon;}
 const button = (text, action, className = 'g-button') => { const value = node('button', className, text); value.type = 'button';const name=text==='撤回'?'undo':/^(新增|新建)/.test(text)?'plus':/^保存/.test(text)?'save':text==='连接选中状态'?'link':/^删除/.test(text)?'trash':text==='回放'?'play':null;if(name)value.prepend(uiIcon(name)); value.addEventListener('click', action); return value; };
@@ -657,7 +657,7 @@ export function mountGraphWorkbench(root, { getWorkspace, changed, persistDraft,
       if (chosen.length) relationPanel.append(node('h4', '', '事件关系'));
       for (const id of chosen) {
         const saved = eventLinks.find(link => link.from_id === id), remembered = relationValues.get(id) || { type: 'associated_with', note: '' };
-        const type = select(relationID('relation', id), [{ value: 'associated_with', label: '关联：不作因果断言' }, { value: 'causes', label: '导致：人工因果判断' }], remembered.type);
+        const type = select(relationID('relation', id), [{ value: 'associated_with', label: '关联：不作因果断言' }, { value: 'causes', label: '导致：人工因果判断' }, { value: 'influences', label: '影响' }, { value: 'unrelated', label: '无关' }, { value: 'insufficient_evidence', label: '证据不足' }], remembered.type);
         const note = textarea(relationID('reason', id), remembered.note, 2);
         for (const [control, initial] of [[type, saved?.type || 'associated_with'], [note, saved?.note || '']]) {
           control.dataset.eventId = id;

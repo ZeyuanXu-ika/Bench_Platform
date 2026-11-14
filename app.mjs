@@ -1,25 +1,23 @@
 import { LABELS, MAX_JSON_BYTES, MAX_ITEMS, MAX_SEGMENTS, MEDIA_RE, blankRecord, cleanSegment, completionErrors,
-  displayTime, editInterval, identifier, makeExport, makeItemExport, makeItemExportFiles, packAnnotationFiles, manifestFromFiles, matchFile, newWorkspace, parseJSON, parseManifest, parseResults, planMediaImport, safeFilename, createWorkspaceHistory } from './core.mjs';
+  displayTime, editInterval, identifier, makeExport, makeItemExport, makeItemExportFiles, packAnnotationFiles, manifestFromFiles, matchFile, newWorkspace, parseManifest, parseResults, planMediaImport, safeFilename, createWorkspaceHistory } from './core.mjs';
 import { listWorkspaces, removeWorkspace, storeWorkspace } from './storage.mjs';
 import { evidenceKey, invalidateEvidence, removeEvidence, migrateLegacyGraph, nextAnnotationId, annotationIdCounters, assertEvidenceTimeChange } from './graph.mjs';
 import { pairMaterialResults } from './material-results.mjs';
+import { exportGT } from './gt-export.mjs';
 import { mountGraphWorkbench, uiIcon } from './graph-ui.mjs';
 import { mountEvidenceEditor } from './evidence-editor.mjs';
 import { annotationNodePresentation } from './graph-view.mjs';
 import { packTimelineRows } from './annotation-timeline.mjs';
 
-import { installGTViewer } from './gt-viewer.mjs';
 
 const $ = id => document.getElementById(id);
-const gtViewer = installGTViewer($('gt-dialog'), parseJSON, MAX_JSON_BYTES);
-$('open-gt').addEventListener('click', () => gtViewer.show());
 function paintPlayIcon(paused){$('play-toggle').replaceChildren(uiIcon(paused?'play':'pause'));$('play-toggle').title=paused?'播放（空格）':'暂停（空格）';}
 const SETTINGS_KEY = `bench-settings-v1:${new URL('.', location.href).pathname}`;
-const DEFAULT_SETTINGS = { height: 'auto', fit: 'contain', speed: '1', step: '0.1', export: 'picker' };
+const DEFAULT_SETTINGS = { height: 'auto', fit: 'contain', speed: '1', step: '0.1', export: 'picker', 'export-format': 'gt' };
 let settings = { ...DEFAULT_SETTINGS };
 try {
   const saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}');
-  for (const [key, values] of Object.entries({ height: ['auto', '320', '420', '540'], fit: ['contain', 'cover'], speed: ['0.5', '0.75', '1', '1.25', '1.5', '2'], step: ['0.04', '0.1', '0.5', '1'], export: ['picker', 'download'] })) {
+  for (const [key, values] of Object.entries({ height: ['auto', '320', '420', '540'], fit: ['contain', 'cover'], speed: ['0.5', '0.75', '1', '1.25', '1.5', '2'], step: ['0.04', '0.1', '0.5', '1'], export: ['picker', 'download'], 'export-format': ['gt', 'native'] })) {
     if (values.includes(saved?.[key])) settings[key] = saved[key];
   }
 } catch { /* Storage can be unavailable; defaults remain usable. */ }
@@ -359,16 +357,8 @@ async function importManifest(file) {
 }
 async function importResults(files) {
   const list=Array.from(files||[]);if(!list.length)return;
-  const inputs = await Promise.all(list.map(async file => ({ file, raw: parseJSON(await readJSON(file)) })));
-  const gt = inputs.find(({ raw }) => typeof raw?.schema_version === 'string' && raw.schema_version.startsWith('trace-label/'));
-  if (gt) {
-    if (inputs.length !== 1) throw new Error('请逐个打开四层 GT JSON；平台标注结果可以批量导入。');
-    pairingItemID = null;
-    await gtViewer.showFile(gt.file);
-    return;
-  }
   graphWorkbench?.autosave();await enqueueDraft();let next=ws;
-  for(const { file, raw } of inputs){const imported=parseResults(raw);
+  for(const file of list){const imported=parseResults(await readJSON(file));
     if(!next){next=imported;for(const task of next.manifest.items)next.records[task.id].annotation_source={file_name:file.name,material_id:task.id,annotation_id:task.id};}
     else next=pairMaterialResults(next,imported,file.name,pairingItemID);
   }
@@ -454,10 +444,18 @@ async function deleteTask() {
 }
 async function exportResults(forceDownload = false, allItems = false) {
   if (!ws || busy) return;
+  graphWorkbench?.autosave();
   graphWorkbench?.assertReadyToExport(allItems ? null : item().id);
   for(const [key,message] of evidenceTimeConflicts){const [workspaceID,itemID,segmentID]=JSON.parse(key);if(workspaceID===ws.id&&(allItems||itemID===item().id)&&ws.records[itemID]?.segments.some(segment=>segment.id===segmentID))throw new Error(`请先调整时间冲突后再保存：${message}`);}
   const currentName = safeFilename(item().media_path.replaceAll('\\', '/').split('/').pop().replace(/\.[^.]+$/, '')) + '.json';
-  const files = allItems ? makeItemExportFiles(ws) : [{ name: currentName, payload: makeItemExport(ws, item().id) }];
+  const exportWorkspace = { ...ws, manifest: {
+    ...ws.manifest, assignment_id: ws.manifest.assignment_id || 'export',
+    annotator_id: ws.manifest.annotator_id || 'export',
+  } };
+  const nativeFiles = allItems ? makeItemExportFiles(exportWorkspace)
+    : [{ name: currentName, payload: makeItemExport(exportWorkspace, item().id) }];
+  const files = settings['export-format'] === 'gt'
+    ? nativeFiles.map(file => ({ ...file, payload: exportGT(file.payload) })) : nativeFiles;
   const exportID = ws.id; const revision = ws.revision;
   const buttons = ['export-result', 'download-result', 'export-all']; busy = true; for (const id of buttons) $(id).disabled = true;
   const download = (body, name, type) => {

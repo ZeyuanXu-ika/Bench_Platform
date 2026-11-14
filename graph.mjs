@@ -4,7 +4,7 @@ export const MAX_GRAPH_LINKS = 50000;
 const COLLECTIONS = ['entities', 'mentions', 'facts', 'events', 'emotion_states', 'emotion_transitions'];
 const TYPES = { entity: 'entities', mention: 'mentions', fact: 'facts', event: 'events', emotion_state: 'emotion_states', emotion_transition: 'emotion_transitions', link: 'links' };
 const REVIEWS = new Set(['draft', 'confirmed', 'needs_review']);
-const EDGE_TYPES = new Set(['evidence:fact:supports', 'fact:event:constitutes', 'fact:emotion_state:grounds', 'event:emotion_state:associated_with', 'event:emotion_state:causes', 'emotion_state:emotion_state:transitions_to', 'event:emotion_transition:associated_with', 'event:emotion_transition:causes']);
+const EDGE_TYPES = new Set(['evidence:fact:supports', 'fact:event:constitutes', 'event:event:constitutes', 'event:emotion_state:unrelated', 'event:emotion_state:insufficient_evidence', 'event:emotion_state:influences', 'event:emotion_transition:unrelated', 'event:emotion_transition:insufficient_evidence', 'event:emotion_transition:influences', 'fact:emotion_state:grounds', 'event:emotion_state:associated_with', 'event:emotion_state:causes', 'emotion_state:emotion_state:transitions_to', 'event:emotion_transition:associated_with', 'event:emotion_transition:causes']);
 const ID_PREFIXES = { entity: 'P', mention: 'M', fact: 'F', event: 'E', emotion_state: 'S', emotion_transition: 'T', link: 'R', evidence: 'W' };
 const allocatedIDs = new WeakMap();
 export function annotationIdCounters(ws) {

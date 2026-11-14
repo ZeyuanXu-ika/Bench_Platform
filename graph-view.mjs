@@ -167,7 +167,7 @@ export function projectGraphView(data, links, focus = null, { page = 0, pageSize
 
 const escapeXML = value => String(value ?? '').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&apos;');
 const colors = { evidence: '#eef2f6', fact: '#edf3e7', event: '#f7f1e4', emotion_state: '#f2edf4', emotion_transition: '#f2edf4' };
-const labels = { supports: '支持', constitutes: '构成', grounds: '情感判断依据', associated_with: '关联', causes: '因果判断', transitions_to: '情感变化', before_state: '变化前', after_state: '变化后' };
+const labels = { supports: '支持', constitutes: '构成', grounds: '情感判断依据', associated_with: '关联', causes: '因果判断', influences: '影响', unrelated: '无关', insufficient_evidence: '证据不足', transitions_to: '情感变化', before_state: '变化前', after_state: '变化后' };
 
 export function serializeFullGraphSVG(data, links, { labelFor = (_type, id) => id, reviewNames = {}, relationNames = {} } = {}) {
   const height = Math.max(260, 80 + Math.max(0, ...data.map(([, entries]) => entries.length)) * 88);

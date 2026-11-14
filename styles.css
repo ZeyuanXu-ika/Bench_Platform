@@ -150,11 +150,3 @@ dialog{border-radius:5px;box-shadow:0 12px 40px #15222e26}dialog::backdrop{backd
 
 /* Explicit per-material result pairing. */
 .task-entry{padding-bottom:5px;margin-bottom:7px;border-bottom:1px solid #e2e7e9;display:flex;flex-direction:column;align-items:stretch}#task-list .task-entry .task-item{margin-bottom:0}.task-annotation-source{display:block;font-size:10px;color:#79858e;line-height:1.6;margin-top:5px;overflow-wrap:anywhere}.task-pair-button{align-self:flex-end;background:transparent;border:0;padding:4px 9px;color:#526e78;font-size:11px}.task-pair-button:hover{background:#e7edee;color:#235e55}
-
-#gt-dialog { width: min(900px, calc(100% - 2rem)); max-height: 90vh; }
-#gt-dialog video { width: 100%; max-height: 35vh; margin-bottom: 12px; }
-.gt-controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; }
-.gt-controls label { display: grid; gap: 4px; }
-#gt-content details { padding: 8px 0; border-bottom: 1px solid currentColor; }
-#gt-content summary { cursor: pointer; overflow-wrap: anywhere; }
-#gt-content pre { white-space: pre-wrap; overflow-wrap: anywhere; }

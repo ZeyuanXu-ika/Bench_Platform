@@ -51,6 +51,10 @@ export function pairMaterialResults(ws, incoming, fileName, expectedID) {
     const record=structuredClone(local.records[source.id]),previous=draft.records[itemID];
     if(previous.media?.size&&record.media?.size&&previous.media.size!==record.media.size)throw new Error(`${itemID} 的素材文件大小与标注记录不一致，不能配对`);
     record.id=itemID;record.annotation_source={file_name:fileName,material_id:itemID,annotation_id:source.id};
+    if (record.gt_source) {
+      const previousIDs = record.gt_node_ids;
+      record.gt_node_ids = Object.fromEntries([...ids].map(([oldID, newID]) => [newID, previousIDs?.[oldID] ?? oldID]));
+    }
     if(previous.media)record.media=previous.media;
     for(const segment of record.segments){const annotation=segment.annotations;if(annotation?.fact_id)annotation.fact_id=remap(annotation.fact_id);if(annotation?.subject_ids)annotation.subject_ids=annotation.subject_ids.map(remap);if(annotation?.subject_id)annotation.subject_id=remap(annotation.subject_id);if(annotation?.speaker_id)annotation.speaker_id=remap(annotation.speaker_id);}
     const updated={...target,...source,id:itemID,media_path:target.media_path,timeline_id:itemID,source_id:itemID};

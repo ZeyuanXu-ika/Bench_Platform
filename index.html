@@ -43,7 +43,7 @@
   </header>
   <main>
     <section id="welcome" class="welcome">
-      <div class="welcome-copy"><h1>导入素材</h1><p>选择本地音视频，或继续已有标注。</p><div class="onboarding-actions"><button id="welcome-media" class="primary">选择音视频</button><button id="welcome-result" class="secondary">导入标注 JSON</button><button id="open-gt" class="secondary">打开四层 GT</button></div><div class="welcome-foot"><button id="welcome-drafts" class="text-button">恢复草稿</button></div></div>
+      <div class="welcome-copy"><h1>导入素材</h1><p>选择本地音视频，或继续已有标注。</p><div class="onboarding-actions"><button id="welcome-media" class="primary">选择音视频</button><button id="welcome-result" class="secondary">导入标注 JSON</button></div><div class="welcome-foot"><button id="welcome-drafts" class="text-button">恢复草稿</button></div></div>
     </section>
     <section id="workspace" class="workspace" hidden>
       <aside class="sidebar">
@@ -94,26 +94,12 @@
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
   <dialog id="help-dialog"><div class="dialog-top"><button class="close-dialog icon-button" aria-label="关闭使用说明">×</button></div><h2>开始标注</h2><ol><li>点击“导入素材”，选择本地音视频；也可以导入已有 JSON，继续编辑。</li><li>在时间轴上拖出证据时间窗，填写内容并选择主体。首次保存证据时会生成对应事实，之后事实独立编辑。</li><li>切换到事实、复合事件和情感脉络，逐层整理内容与支撑关系；在关联图谱中查看四层关联。</li><li>编辑内容会自动保存为浏览器草稿。使用“保存当前素材 JSON”或“下载 JSON”生成独立文件，每条素材对应一份标注。</li></ol><details><summary>标注规则</summary><p>事实可以引用多条证据，编辑事实不会改动证据。复合事件的时间取构成事实时间窗的并集。</p><p>情感状态至少由一条事实或一个复合事件支撑。选中事件时默认带入构成事实，可取消无关事实；“导致”关系须填写依据。</p><p>主体输入名字后按回车添加；输入框为空时按退格移除最后一个选择。已选引用卡再次点击后，退格仅解除该关联。</p></details><p><kbd>空格</kbd> 播放或暂停，<kbd>,</kbd> / <kbd>.</kbd> 步进；<kbd>[</kbd> / <kbd>]</kbd> 标记起止点，<kbd>Enter</kbd> 创建时间窗。选中节点后可按退格删除，误操作可撤回；输入文本时标注快捷键暂停。</p><p>浏览器草稿可能被清理，请定期导出 JSON 备份。重新打开时可以恢复草稿，素材需要重新选择。</p><a href="./README.md" target="_blank" rel="noopener">完整使用与结果格式说明 ↗</a></dialog>
   <dialog id="draft-dialog"><div class="dialog-top"><button class="close-dialog icon-button" aria-label="关闭草稿列表">×</button></div><h2>恢复草稿</h2><div id="draft-list"></div></dialog>
-  <dialog id="gt-dialog" aria-labelledby="gt-title">
-    <div class="dialog-top"><button class="close-dialog icon-button" aria-label="关闭 GT 查看器">×</button></div>
-    <h2 id="gt-title">四层 GT 查看器</h2>
-    <p>查看原始 GT 字段和证据，支持从本地视频回看。</p>
-    <div class="gt-controls">
-      <label>GT JSON <input id="gt-file" type="file" accept=".json,application/json"></label>
-      <label>对应视频 <input id="gt-media" type="file" accept="video/*,.mp4,.webm,.mov" disabled></label>
-      <button id="gt-download" type="button" class="secondary" disabled>下载原始 GT JSON</button>
-    </div>
-    <p id="gt-status" role="status">请选择 trace-label/1.0 格式的 GT JSON。</p>
-    <video controls preload="metadata" hidden></video>
-    <label>标注层 <select id="gt-layer"><option value="video">素材信息</option></select></label>
-    <div id="gt-content"></div>
-  </dialog>
   <dialog id="settings-dialog">
     <div class="dialog-top"><button class="close-dialog icon-button" aria-label="关闭工作台设置">×</button></div>
     <h2>设置</h2>
     <p id="deployment-mode"></p>
     <section class="setup-section"><h3>素材</h3><div class="setup-actions"><button id="setup-media" class="secondary small">导入素材</button><button id="setup-result" class="quiet">导入已有结果</button></div><p id="setup-input-summary"></p></section>
-    <section class="setup-section"><h3>导出</h3><label>默认导出方式<select id="setting-export"><option value="picker">导出时选择本地保存位置</option><option value="download">使用浏览器下载 JSON</option></select></label><p>JSON 不包含音视频文件。</p></section>
+    <section class="setup-section"><h3>导出</h3><label>默认导出方式<select id="setting-export"><option value="picker">导出时选择本地保存位置</option><option value="download">使用浏览器下载 JSON</option></select></label><label>导出 JSON 格式<select id="setting-export-format"><option value="gt">四层 GT（trace-label/1.0）</option><option value="native">平台原生备份（trace-annotations/2.0）</option></select></label><p>JSON 不包含音视频文件。</p></section>
     <section class="setup-section"><h3>播放</h3><div class="setup-grid"><label>画面高度<select id="setting-height"><option value="auto">跟随窗口大小</option><option value="320">320 px</option><option value="420">420 px</option><option value="540">540 px</option></select></label><label>画面适配<select id="setting-fit"><option value="contain">完整显示，保留黑边</option><option value="cover">填满区域，可能裁切</option></select></label><label>默认播放速度<select id="setting-speed"><option value="0.5">0.5×</option><option value="0.75">0.75×</option><option value="1">1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label><label>无参考帧率时的步进<select id="setting-step"><option value="0.04">0.04 秒</option><option value="0.1">0.1 秒</option><option value="0.5">0.5 秒</option><option value="1">1 秒</option></select></label></div></section>
     <div class="setup-actions"><button id="save-settings" class="primary small">保存并应用</button><button id="reset-settings" class="quiet">恢复默认设置</button></div><p>设置保存在当前浏览器。</p>
   </dialog>

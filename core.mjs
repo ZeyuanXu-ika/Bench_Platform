@@ -1,4 +1,5 @@
 import { blankGraph, normalizeGraph, migrateLegacyGraph, eventTimeRanges, factTemporalDetails, annotationIdCounters, evidenceKey, graphIssues, assertTemporalOrder } from './graph.mjs';
+import { convertGT } from './gt-import.mjs';
 import { materialWorkspace } from './material-scope.mjs';
 
 export const VERSION = '2.0';
@@ -175,12 +176,17 @@ export function cleanRecord(raw, item) {
     size: finite(raw.media.size, '文件大小'), last_modified: finite(raw.media.last_modified, '文件修改时间'),
     duration_s: finite(raw.media.duration_s, '媒体实际时长', null),
   };
+  if (raw.gt_source?.schema_version === 'trace-label/1.0') {
+    record.gt_source = structuredClone(raw.gt_source);
+    if (raw.gt_node_ids) record.gt_node_ids = structuredClone(raw.gt_node_ids);
+  }
   if(raw.annotation_source)record.annotation_source={file_name:text(raw.annotation_source.file_name,'标注文件名',1024),material_id:identifier(raw.annotation_source.material_id,'标注素材 ID'),annotation_id:identifier(raw.annotation_source.annotation_id,'标注 ID')};
   if (record.status === 'complete' && completionErrors(item, record).length) throw new Error(`${item.id} 标记为已完成，但必填字段不完整`);
   return record;
 }
 export function parseResults(input) {
-  const raw = typeof input === 'string' ? parseJSON(input) : input;
+  const parsed = typeof input === 'string' ? parseJSON(input) : input;
+  const raw = typeof parsed?.schema_version === 'string' && parsed.schema_version.startsWith('trace-label/') ? convertGT(parsed) : parsed;
   if (raw?.format !== 'trace-annotations' || !['1.0', VERSION].includes(raw.schema_version)) throw new Error('请选择本平台导出的 1.0 或 2.0 版本结果文件');
   const manifest = parseManifest(raw);
   if(raw.export_scope==='item'&&(manifest.items.length!==1||raw.source_item_id!==manifest.items[0].id))throw new Error('标注的 source_item_id 与素材编号不一致');
