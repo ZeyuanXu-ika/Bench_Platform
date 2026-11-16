@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseManifest, parseResults, newWorkspace, makeExport, blankRecord, matchFile, completionErrors, mediaPath, manifestFromFiles, planMediaImport, editInterval, MAX_ITEMS, MAX_SEGMENTS } from '../core.mjs';
+import { parseManifest, parseResults, newWorkspace, makeExport, blankRecord, matchFile, completionErrors, mediaPath, manifestFromFiles, planMediaImport, editInterval, MAX_ITEMS } from '../core.mjs';
 
 function manifest() { return parseManifest({ batch_id: 'batch_001', assignment_id: 'task_a', annotator_id: 'ann01', items: [
   { id: 'video_01', media_path: 'video/demo.mp4', media_type: 'video', duration_s: 12, clip_start_s: 600, video_fps: 25 },
@@ -74,11 +74,18 @@ test('local facts belong to individual windows and survive export, while legacy 
   const legacy = makeExport(complete(newWorkspace(manifest()))); delete legacy.items[0].segments[0].annotations.local_fact;
   assert.equal(parseResults(legacy).records.video_01.segments[0].annotations.observation, '画面有测试色块');
 });
-test('imports reject repeated segment IDs, unsupported versions and excessive segments', () => {
+test('imports reject repeated segment IDs and unsupported versions', () => {
   const data = makeExport(complete(newWorkspace(manifest())));
   data.items[0].segments.push({ ...data.items[0].segments[0] }); assert.throws(() => parseResults(data), /重复/);
-  data.items[0].segments = Array(MAX_SEGMENTS + 1).fill(data.items[0].segments[0]); assert.throws(() => parseResults(data), new RegExp(String(MAX_SEGMENTS)));
   data.schema_version = '99'; assert.throws(() => parseResults(data), /版本/);
+});
+
+test('a material with 10,000 windows can be imported and exported', () => {
+  const data = makeExport(complete(newWorkspace(manifest())));
+  const [segment] = data.items[0].segments;
+  data.items[0].segments = Array.from({ length: 10000 }, (_, i) => ({ ...segment, id: `s_${i+1}` }));
+  const restored = parseResults(JSON.stringify(data));
+  assert.deepEqual(makeExport(restored).items[0].segments, data.items[0].segments);
 });
 
 test('moving a time frame preserves its length and clamps to both media boundaries', () => {

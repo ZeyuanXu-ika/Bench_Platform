@@ -1,5 +1,5 @@
 import { evidenceNodes, evidenceKey, factTimeRanges, eventTimeRanges, invalidateEvidence, invalidateFactDependents, nextAnnotationId, assertTemporalOrder } from './graph.mjs';
-import { cleanSegment, MAX_SEGMENTS } from './core.mjs';
+import { cleanSegment } from './core.mjs';
 import { factColor, LAYER_COLORS } from './graph-view.mjs';
 
 const names = { facts: '事实时间轴', events: '复合事件时间轴', emotions: '情感脉络时间轴' };
