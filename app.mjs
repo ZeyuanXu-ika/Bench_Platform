@@ -257,7 +257,7 @@ function markEnd() {
 function addSegment() {
   if (!ws || !loaded) throw new Error('请先选择并加载本地素材');
   if ($('segment-start').value === '' || $('segment-end').value === '') throw new Error('请先标记起点和终点');
-  if (record().segments.length >= MAX_SEGMENTS) throw new Error('单条素材最多支持 1000 个时间窗，请拆分任务');
+  if (record().segments.length >= MAX_SEGMENTS) throw new Error(`单条素材最多支持 ${MAX_SEGMENTS} 个时间窗，请拆分任务`);
   const next = cleanSegment({ id: nextAnnotationId(ws, 'evidence'), start_time: Number($('segment-start').value), end_time: Number($('segment-end').value),
     label: 'unclassified', annotations: {} }, item());
   record().segments.push(next);

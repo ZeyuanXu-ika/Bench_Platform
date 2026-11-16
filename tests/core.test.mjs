@@ -77,7 +77,7 @@ test('local facts belong to individual windows and survive export, while legacy 
 test('imports reject repeated segment IDs, unsupported versions and excessive segments', () => {
   const data = makeExport(complete(newWorkspace(manifest())));
   data.items[0].segments.push({ ...data.items[0].segments[0] }); assert.throws(() => parseResults(data), /重复/);
-  data.items[0].segments = Array(MAX_SEGMENTS + 1).fill(data.items[0].segments[0]); assert.throws(() => parseResults(data), /1000/);
+  data.items[0].segments = Array(MAX_SEGMENTS + 1).fill(data.items[0].segments[0]); assert.throws(() => parseResults(data), new RegExp(String(MAX_SEGMENTS)));
   data.schema_version = '99'; assert.throws(() => parseResults(data), /版本/);
 });
 

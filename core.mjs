@@ -28,7 +28,7 @@ export function createWorkspaceHistory({ maxSteps = 30, maxBytes = 32 * 1024 * 1
 }
 export const MAX_JSON_BYTES = 20 * 1024 * 1024;
 export const MAX_ITEMS = 5000;
-export const MAX_SEGMENTS = 1000;
+export const MAX_SEGMENTS = 2000;
 export const LABELS = [
   { id: 'unclassified', name: '待分类', color: '#687684', key: '0' },
   { id: 'visual_observation', name: '视觉观察', color: '#377860', key: '1' },
@@ -166,7 +166,7 @@ export function completionErrors(item, record) {
   return errors;
 }
 export function cleanRecord(raw, item) {
-  if (!Array.isArray(raw.segments) || raw.segments.length > MAX_SEGMENTS) throw new Error('片段列表无效或超过 1000 条');
+  if (!Array.isArray(raw.segments) || raw.segments.length > MAX_SEGMENTS) throw new Error(`片段列表无效或超过 ${MAX_SEGMENTS} 条`);
   const segments = raw.segments.map(s => cleanSegment(s, item));
   if (new Set(segments.map(s => s.id)).size !== segments.length) throw new Error('片段 ID 重复');
   const record = { id: item.id, status: raw.status === 'complete' ? 'complete' : 'draft', segments,
